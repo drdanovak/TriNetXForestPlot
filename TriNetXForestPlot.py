@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import io
 
 plt.style.use("seaborn-v0_8-whitegrid")
-
 st.set_page_config(layout="wide")
 st.title("🌲 Forest Plot Generator")
 
@@ -60,21 +59,25 @@ if df is not None:
             marker_color = "black"
 
     if st.button("📊 Generate Forest Plot"):
-        # Parse headers and groupings if selected
+        # Initialize containers
         rows = []
         y_labels = []
+        indent_spaces = "\u00A0" * 4  # Indent for grouped outcomes
+        group_name = ""
         skip_indices = []
 
+        # Parse group structure
         for i, row in df.iterrows():
             if use_groups and isinstance(row["Outcome"], str) and row["Outcome"].startswith("##"):
-                y_labels.append(row["Outcome"][3:].strip())
+                group_name = row["Outcome"][3:].strip()
+                y_labels.append(group_name)  # Header, not indented
                 rows.append(None)
                 skip_indices.append(i)
             else:
-                y_labels.append(row["Outcome"])
+                display_name = f"{indent_spaces}{row['Outcome']}" if group_name else row["Outcome"]
+                y_labels.append(display_name)
                 rows.append(row)
 
-        # Create plot
         fig, ax = plt.subplots(figsize=(10, len(y_labels) * 0.7))
         valid_indices = [i for i in range(len(rows)) if rows[i] is not None]
 
@@ -98,7 +101,6 @@ if df is not None:
                     label = f"{effect:.2f} [{lci:.2f}, {uci:.2f}]"
                     ax.text(uci + label_offset, i, label, va='center', fontsize=font_size - 2)
 
-        # Format axis
         ax.axvline(x=1, color='gray', linestyle='--', linewidth=1)
         ax.set_yticks(range(len(y_labels)))
         ax.set_yticklabels(y_labels, fontsize=font_size)
@@ -112,7 +114,7 @@ if df is not None:
             ax.set_xscale('log')
 
         # Auto y padding based on font size
-        y_pad = (font_size / 12) * 0.5  # Adjust multiplier if needed
+        y_pad = (font_size / 12) * 0.5
         ax.set_ylim(len(y_labels) - 1 + y_pad, -1 - y_pad)
 
         ax.set_xlabel(x_axis_label, fontsize=font_size)
