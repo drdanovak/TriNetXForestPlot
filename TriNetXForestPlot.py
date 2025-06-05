@@ -3,10 +3,13 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import io
 
+# Use clean whitegrid style
 plt.style.use("seaborn-v0_8-whitegrid")
+
 st.set_page_config(layout="wide")
 st.title("🌲 Forest Plot Generator")
 
+# Input method
 input_mode = st.radio("Select data input method:", ["📤 Upload file", "✍️ Manual entry"], horizontal=True)
 
 required_cols = ["Outcome", "Effect Size", "Lower CI", "Upper CI"]
@@ -50,6 +53,7 @@ if df is not None:
         label_offset = st.slider("Label Horizontal Offset", 0.01, 0.3, 0.05)
         use_log = st.checkbox("Use Log Scale for X-axis", value=False)
         axis_padding = st.slider("X-axis Padding (%)", 2, 40, 10)
+        y_axis_padding = st.slider("Y-axis Padding (Rows)", 0.0, 5.0, 1.0, step=0.5)
 
         if color_scheme == "Color":
             ci_color = st.color_picker("CI Color", "#1f77b4")
@@ -59,35 +63,35 @@ if df is not None:
             marker_color = "black"
 
     if st.button("📊 Generate Forest Plot"):
-        # Initialize containers
         rows = []
         y_labels = []
-        indent_spaces = "\u00A0" * 4  # Indent for grouped outcomes
-        group_name = ""
-        skip_indices = []
+        text_styles = []
+        indent = "\u00A0" * 4
+        group_mode = False
 
-        # Parse group structure
         for i, row in df.iterrows():
             if use_groups and isinstance(row["Outcome"], str) and row["Outcome"].startswith("##"):
-                group_name = row["Outcome"][3:].strip()
-                y_labels.append(group_name)  # Header, not indented
+                header = row["Outcome"][3:].strip()
+                y_labels.append(header)
+                text_styles.append("bold")
                 rows.append(None)
-                skip_indices.append(i)
+                group_mode = True
             else:
-                display_name = f"{indent_spaces}{row['Outcome']}" if group_name else row["Outcome"]
+                display_name = f"{indent}{row['Outcome']}" if group_mode else row["Outcome"]
                 y_labels.append(display_name)
+                text_styles.append("normal")
                 rows.append(row)
 
         fig, ax = plt.subplots(figsize=(10, len(y_labels) * 0.7))
-        valid_indices = [i for i in range(len(rows)) if rows[i] is not None]
+        valid_rows = [i for i in range(len(rows)) if rows[i] is not None]
 
-        # Calculate axis limits
+        # Axis limits with padding
         ci_vals = pd.concat([df["Lower CI"].dropna(), df["Upper CI"].dropna()])
         x_min, x_max = ci_vals.min(), ci_vals.max()
         x_pad = (x_max - x_min) * (axis_padding / 100)
         ax.set_xlim(x_min - x_pad, x_max + x_pad)
 
-        # Plot rows
+        # Plot
         for i, row in enumerate(rows):
             if row is None:
                 continue
@@ -101,28 +105,35 @@ if df is not None:
                     label = f"{effect:.2f} [{lci:.2f}, {uci:.2f}]"
                     ax.text(uci + label_offset, i, label, va='center', fontsize=font_size - 2)
 
+        # Reference line at 1
         ax.axvline(x=1, color='gray', linestyle='--', linewidth=1)
-        ax.set_yticks(range(len(y_labels)))
-        ax.set_yticklabels(y_labels, fontsize=font_size)
 
+        # Custom tick labels with styling
+        ax.set_yticks(range(len(y_labels)))
+        for tick_label, style in zip(ax.set_yticklabels(y_labels), text_styles):
+            if style == "bold":
+                tick_label.set_fontweight("bold")
+            tick_label.set_fontsize(font_size)
+
+        if use_log:
+            ax.set_xscale('log')
         if show_grid:
             ax.grid(True, axis='x', linestyle=':', linewidth=0.6)
         else:
             ax.grid(False)
 
-        if use_log:
-            ax.set_xscale('log')
+        # Y-axis padding
+        ax.set_ylim(len(y_labels) - 1 + y_axis_padding, -1 - y_axis_padding)
 
-        # Auto y padding based on font size
-        y_pad = (font_size / 12) * 0.5
-        ax.set_ylim(len(y_labels) - 1 + y_pad, -1 - y_pad)
-
+        # Labels
         ax.set_xlabel(x_axis_label, fontsize=font_size)
         ax.set_title(plot_title, fontsize=font_size + 2, weight='bold')
         fig.tight_layout()
 
+        # Display plot
         st.pyplot(fig)
 
+        # Download
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=300)
         st.download_button("📥 Download Plot as PNG", data=buf.getvalue(), file_name="forest_plot.png", mime="image/png")
