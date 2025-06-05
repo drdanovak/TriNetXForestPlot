@@ -8,7 +8,6 @@ plt.style.use("seaborn-v0_8-whitegrid")
 st.set_page_config(layout="wide")
 st.title("🌲 Forest Plot Generator")
 
-# Input method
 input_mode = st.radio("Select data input method:", ["📤 Upload file", "✍️ Manual entry"], horizontal=True)
 
 required_cols = ["Outcome", "Effect Size", "Lower CI", "Upper CI"]
@@ -29,10 +28,10 @@ if input_mode == "📤 Upload file":
             st.error(f"Error reading file: {e}")
 else:
     default_data = pd.DataFrame({
-        "Outcome": ["Hypertension", "Diabetes", "Obesity"],
-        "Effect Size": [1.5, 0.85, 1.2],
-        "Lower CI": [1.2, 0.7, 1.0],
-        "Upper CI": [1.8, 1.0, 1.4],
+        "Outcome": ["## Cardiovascular", "Hypertension", "Stroke", "## Metabolic", "Diabetes", "Obesity"],
+        "Effect Size": [None, 1.5, 1.2, None, 0.85, 1.2],
+        "Lower CI": [None, 1.2, 1.0, None, 0.7, 1.0],
+        "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
     })
     df = st.data_editor(default_data, num_rows="dynamic", use_container_width=True, key="manual_input_table")
 
@@ -42,6 +41,7 @@ if df is not None:
     x_axis_label = st.sidebar.text_input("X-axis Label", value="Effect Size (RR / OR / HR)")
     show_grid = st.sidebar.checkbox("Show Grid", value=True)
     show_values = st.sidebar.checkbox("Show Numerical Annotations", value=False)
+    use_groups = st.sidebar.checkbox("Treat rows starting with '##' as section headers", value=True)
 
     with st.sidebar.expander("🎨 Advanced Visual Controls", expanded=False):
         color_scheme = st.selectbox("Color Scheme", ["Color", "Black & White"])
@@ -60,26 +60,48 @@ if df is not None:
             marker_color = "black"
 
     if st.button("📊 Generate Forest Plot"):
-        fig, ax = plt.subplots(figsize=(10, len(df) * 0.7))
-        y_pos = range(len(df))
+        # Parse headers and groupings if selected
+        rows = []
+        y_labels = []
+        skip_indices = []
 
-        # Plot points and CIs
         for i, row in df.iterrows():
-            ax.hlines(y=i, xmin=row["Lower CI"], xmax=row["Upper CI"],
-                      color=ci_color, linewidth=line_width, capstyle='round')
-            ax.plot(row["Effect Size"], i, 'o',
-                    color=marker_color, markersize=point_size)
-            if show_values:
-                annotation = f'{row["Effect Size"]:.2f} [{row["Lower CI"]:.2f}, {row["Upper CI"]:.2f}]'
-                ax.text(row["Upper CI"] + label_offset, i, annotation,
-                        va='center', fontsize=font_size - 2)
+            if use_groups and isinstance(row["Outcome"], str) and row["Outcome"].startswith("##"):
+                y_labels.append(row["Outcome"][3:].strip())
+                rows.append(None)
+                skip_indices.append(i)
+            else:
+                y_labels.append(row["Outcome"])
+                rows.append(row)
 
-        # Aesthetic and axis setup
-        ax.set_yticks(list(y_pos))
-        ax.set_yticklabels(df["Outcome"], fontsize=font_size)
+        # Create plot
+        fig, ax = plt.subplots(figsize=(10, len(y_labels) * 0.7))
+        valid_indices = [i for i in range(len(rows)) if rows[i] is not None]
+
+        # Calculate axis limits
+        ci_vals = pd.concat([df["Lower CI"].dropna(), df["Upper CI"].dropna()])
+        x_min, x_max = ci_vals.min(), ci_vals.max()
+        x_pad = (x_max - x_min) * (axis_padding / 100)
+        ax.set_xlim(x_min - x_pad, x_max + x_pad)
+
+        # Plot rows
+        for i, row in enumerate(rows):
+            if row is None:
+                continue
+            effect = row["Effect Size"]
+            lci = row["Lower CI"]
+            uci = row["Upper CI"]
+            if pd.notnull(effect) and pd.notnull(lci) and pd.notnull(uci):
+                ax.hlines(i, xmin=lci, xmax=uci, color=ci_color, linewidth=line_width, capstyle='round')
+                ax.plot(effect, i, 'o', color=marker_color, markersize=point_size)
+                if show_values:
+                    label = f"{effect:.2f} [{lci:.2f}, {uci:.2f}]"
+                    ax.text(uci + label_offset, i, label, va='center', fontsize=font_size - 2)
+
+        # Format axis
         ax.axvline(x=1, color='gray', linestyle='--', linewidth=1)
-        ax.set_xlabel(x_axis_label, fontsize=font_size)
-        ax.set_title(plot_title, fontsize=font_size + 2, weight='bold')
+        ax.set_yticks(range(len(y_labels)))
+        ax.set_yticklabels(y_labels, fontsize=font_size)
 
         if show_grid:
             ax.grid(True, axis='x', linestyle=':', linewidth=0.6)
@@ -89,19 +111,16 @@ if df is not None:
         if use_log:
             ax.set_xscale('log')
 
-        # Auto axis limits with padding
-        all_ci = pd.concat([df["Lower CI"], df["Upper CI"]])
-        x_min = all_ci.min()
-        x_max = all_ci.max()
-        pad = (x_max - x_min) * (axis_padding / 100)
-        ax.set_xlim(x_min - pad, x_max + pad)
+        # Auto y padding based on font size
+        y_pad = (font_size / 12) * 0.5  # Adjust multiplier if needed
+        ax.set_ylim(len(y_labels) - 1 + y_pad, -1 - y_pad)
 
-        ax.invert_yaxis()
+        ax.set_xlabel(x_axis_label, fontsize=font_size)
+        ax.set_title(plot_title, fontsize=font_size + 2, weight='bold')
         fig.tight_layout()
 
         st.pyplot(fig)
 
-        # PNG Download
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=300)
         st.download_button("📥 Download Plot as PNG", data=buf.getvalue(), file_name="forest_plot.png", mime="image/png")
