@@ -7,7 +7,7 @@ import io
 plt.style.use("seaborn-v0_8-whitegrid")
 
 st.set_page_config(layout="wide")
-st.title("🌲 Forest Plot Generator")
+st.title("🌲 Novak's TriNetX Forest Plot Generator")
 
 # Input method
 input_mode = st.radio("Select data input method:", ["📤 Upload file", "✍️ Manual entry"], index=1, horizontal=True)
