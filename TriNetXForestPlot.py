@@ -10,7 +10,7 @@ st.set_page_config(layout="wide")
 st.title("🌲 Forest Plot Generator")
 
 # Input method
-input_mode = st.radio("Select data input method:", ["📤 Upload file", "✍️ Manual entry"], horizontal=True)
+input_mode = st.radio("Select data input method:", ["📤 Upload file", "✍️ Manual entry"], index=1, horizontal=True)
 
 required_cols = ["Outcome", "Effect Size", "Lower CI", "Upper CI"]
 df = None
