@@ -54,6 +54,8 @@ if df is not None:
         use_log = st.checkbox("Use Log Scale for X-axis", value=False)
         axis_padding = st.slider("X-axis Padding (%)", 2, 40, 10)
         y_axis_padding = st.slider("Y-axis Padding (Rows)", 0.0, 5.0, 1.0, step=0.5)
+        # Adjustable tick height
+        cap_height = st.slider("Tick Height (for CI ends)", 0.05, 0.5, 0.18, step=0.01)
 
         if color_scheme == "Color":
             ci_color = st.color_picker("CI Color", "#1f77b4")
@@ -99,8 +101,13 @@ if df is not None:
             lci = row["Lower CI"]
             uci = row["Upper CI"]
             if pd.notnull(effect) and pd.notnull(lci) and pd.notnull(uci):
+                # Draw CI line
                 ax.hlines(i, xmin=lci, xmax=uci, color=ci_color, linewidth=line_width, capstyle='round')
+                # Draw tick marks (caps) at both ends
+                ax.vlines([lci, uci], [i - cap_height, i - cap_height], [i + cap_height, i + cap_height], color=ci_color, linewidth=line_width)
+                # Draw effect size marker
                 ax.plot(effect, i, 'o', color=marker_color, markersize=point_size)
+                # Show values if needed
                 if show_values:
                     label = f"{effect:.2f} [{lci:.2f}, {uci:.2f}]"
                     ax.text(uci + label_offset, i, label, va='center', fontsize=font_size - 2)
