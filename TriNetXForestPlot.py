@@ -7,7 +7,6 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Use clean whitegrid style
 plt.style.use("seaborn-v0_8-whitegrid")
 
 st.set_page_config(layout="wide")
@@ -15,28 +14,69 @@ st.title("🌲 Novak's TriNetX Forest Plot Generator")
 
 REQUIRED_COLS = ["Outcome", "Effect Size", "Lower CI", "Upper CI"]
 DELETE_COL = "🗑 Delete"
+ORDER_COL = "↕ Order"
 
 
 # ----------------------------
-# Row deletion helper
+# Table helpers: order + insert + move + delete
 # ----------------------------
-def editable_table_with_deletion(df_seed: pd.DataFrame, state_key: str):
+def _normalize_table(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Ensure control columns exist
+    if ORDER_COL not in df.columns:
+        df.insert(0, ORDER_COL, list(range(1, len(df) + 1)))
+    if DELETE_COL not in df.columns:
+        df.insert(0, DELETE_COL, False)
+
+    # Coerce order to numeric, fill missing
+    df[ORDER_COL] = pd.to_numeric(df[ORDER_COL], errors="coerce")
+    if df[ORDER_COL].isna().any():
+        max_order = df[ORDER_COL].max(skipna=True)
+        max_order = 0 if pd.isna(max_order) else int(max_order)
+        na_idx = df[df[ORDER_COL].isna()].index.tolist()
+        for k, idx in enumerate(na_idx, start=1):
+            df.loc[idx, ORDER_COL] = max_order + k
+
+    # Normalize delete col
+    df[DELETE_COL] = df[DELETE_COL].fillna(False).astype(bool)
+
+    # Sort by order and re-number sequentially (stable)
+    df = df.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
+    df[ORDER_COL] = range(1, len(df) + 1)
+    return df
+
+
+def _blank_row_for(df: pd.DataFrame) -> dict:
+    # Create a blank row matching df's columns
+    row = {}
+    for c in df.columns:
+        if c == DELETE_COL:
+            row[c] = False
+        elif c == ORDER_COL:
+            row[c] = None
+        elif c in ["Effect Size", "Lower CI", "Upper CI"]:
+            row[c] = None
+        else:
+            row[c] = ""
+    return row
+
+
+def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
     """
-    Renders a data_editor with a delete-checkbox column and a delete button.
-    Uses st.session_state to persist edits/deletions across reruns.
+    Data editor + row ops:
+      - move row up/down
+      - insert blank row above/below
+      - delete checked rows
+    Uses session_state to persist.
     """
     if state_key not in st.session_state:
-        df0 = df_seed.copy()
-        if DELETE_COL not in df0.columns:
-            df0.insert(0, DELETE_COL, False)
-        st.session_state[state_key] = df0
+        st.session_state[state_key] = _normalize_table(df_seed)
 
-    # Ensure delete col exists even if seed schema changed
-    if DELETE_COL not in st.session_state[state_key].columns:
-        df_tmp = st.session_state[state_key].copy()
-        df_tmp.insert(0, DELETE_COL, False)
-        st.session_state[state_key] = df_tmp
+    # Always normalize before showing
+    st.session_state[state_key] = _normalize_table(st.session_state[state_key])
 
+    # Editor
     edited = st.data_editor(
         st.session_state[state_key],
         num_rows="dynamic",
@@ -44,25 +84,74 @@ def editable_table_with_deletion(df_seed: pd.DataFrame, state_key: str):
         key=f"editor_{state_key}",
     )
 
-    # Persist edits
-    st.session_state[state_key] = edited
+    # Persist edits and normalize again (handles newly added rows)
+    st.session_state[state_key] = _normalize_table(edited)
 
-    cols = st.columns([1, 6])
+    df_now = st.session_state[state_key]
+
+    # Row ops UI
+    st.caption("Row tools: move, insert between, delete. (Use the order column or buttons below.)")
+    if len(df_now) == 0:
+        return df_now
+
+    labels = []
+    for i in range(len(df_now)):
+        outcome = df_now.loc[i, "Outcome"] if "Outcome" in df_now.columns else ""
+        outcome = "" if pd.isna(outcome) else str(outcome)
+        labels.append(f"{i+1}: {outcome[:60]}")
+
+    cols = st.columns([3, 1, 1, 1, 1, 2])
     with cols[0]:
-        if st.button("🗑 Delete checked rows", key=f"delbtn_{state_key}"):
-            df_now = st.session_state[state_key].copy()
-            mask = df_now[DELETE_COL].fillna(False).astype(bool)
-            df_now = df_now.loc[~mask].copy()
-            if DELETE_COL in df_now.columns:
-                df_now[DELETE_COL] = False
-            st.session_state[state_key] = df_now
-            st.rerun()
+        selected = st.selectbox("Select row", options=labels, key=f"sel_{state_key}")
+        sel_idx = int(selected.split(":")[0]) - 1
+
+    def commit(new_df):
+        st.session_state[state_key] = _normalize_table(new_df)
+        st.rerun()
+
+    with cols[1]:
+        if st.button("⬆️ Up", key=f"up_{state_key}", disabled=(sel_idx <= 0)):
+            new_df = df_now.copy()
+            # swap sel_idx with sel_idx-1 by moving
+            row = new_df.iloc[[sel_idx]].copy()
+            new_df = new_df.drop(new_df.index[sel_idx]).reset_index(drop=True)
+            new_df = pd.concat([new_df.iloc[: sel_idx - 1], row, new_df.iloc[sel_idx - 1 :]], ignore_index=True)
+            commit(new_df)
+
+    with cols[2]:
+        if st.button("⬇️ Down", key=f"down_{state_key}", disabled=(sel_idx >= len(df_now) - 1)):
+            new_df = df_now.copy()
+            row = new_df.iloc[[sel_idx]].copy()
+            new_df = new_df.drop(new_df.index[sel_idx]).reset_index(drop=True)
+            new_df = pd.concat([new_df.iloc[: sel_idx + 1], row, new_df.iloc[sel_idx + 1 :]], ignore_index=True)
+            commit(new_df)
+
+    with cols[3]:
+        if st.button("➕ Above", key=f"ins_above_{state_key}"):
+            new_df = df_now.copy()
+            blank = pd.DataFrame([_blank_row_for(new_df)])
+            new_df = pd.concat([new_df.iloc[:sel_idx], blank, new_df.iloc[sel_idx:]], ignore_index=True)
+            commit(new_df)
+
+    with cols[4]:
+        if st.button("➕ Below", key=f"ins_below_{state_key}"):
+            new_df = df_now.copy()
+            blank = pd.DataFrame([_blank_row_for(new_df)])
+            new_df = pd.concat([new_df.iloc[: sel_idx + 1], blank, new_df.iloc[sel_idx + 1 :]], ignore_index=True)
+            commit(new_df)
+
+    with cols[5]:
+        if st.button("🗑 Delete checked", key=f"del_{state_key}"):
+            new_df = df_now.copy()
+            mask = new_df[DELETE_COL].fillna(False).astype(bool)
+            new_df = new_df.loc[~mask].copy().reset_index(drop=True)
+            commit(new_df)
 
     return st.session_state[state_key]
 
 
 # ----------------------------
-# TriNetX export parsing utils
+# TriNetX parsing utils
 # ----------------------------
 def _clean_line(s: str) -> str:
     if s is None:
@@ -152,9 +241,7 @@ def _parse_section_effect(lines, section_name: str):
                 uci = uci if uci is not None else uci2
 
             if eff is not None and lci is not None and uci is not None:
-                results.append(
-                    {"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci}
-                )
+                results.append({"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci})
 
     return results
 
@@ -208,6 +295,7 @@ def parse_uploaded_trinetx_file(uploaded_file):
 
     if ext == "docx":
         from docx import Document
+
         doc = Document(io.BytesIO(uploaded_file.getvalue()))
         lines = []
         for p in doc.paragraphs:
@@ -230,71 +318,36 @@ def insert_section_headers(df: pd.DataFrame, group_col: str, header_prefix: str 
 
     out_rows = []
     for g, sub in df.groupby(group_col, sort=False):
-        out_rows.append(
-            {"Outcome": f"{header_prefix}{g}", "Effect Size": None, "Lower CI": None, "Upper CI": None}
-        )
+        out_rows.append({"Outcome": f"{header_prefix}{g}", "Effect Size": None, "Lower CI": None, "Upper CI": None})
         out_rows.extend(sub[REQUIRED_COLS].to_dict("records"))
 
     return pd.DataFrame(out_rows)
 
 
 # ----------------------------
-# Input mode UI
+# Input mode UI (re-ordered)
 # ----------------------------
 input_mode = st.radio(
     "Select data input method:",
-    ["📤 Upload structured file", "📄 Import TriNetX export table(s)", "✍️ Manual entry"],
-    index=2,
+    ["✍️ Manual entry", "📄 Import TriNetX tables", "📤 Upload structured file"],
+    index=0,
     horizontal=True,
 )
 
 df = None
 
-if input_mode == "📤 Upload structured file":
-    st.subheader("Upload a structured file")
-
-    # Template download
-    template_df = pd.DataFrame(
+if input_mode == "✍️ Manual entry":
+    default_data = pd.DataFrame(
         {
-            "Outcome": ["## Cardiovascular", "Hypertension", "Stroke"],
-            "Effect Size": [None, 1.50, 1.20],
-            "Lower CI": [None, 1.20, 1.00],
-            "Upper CI": [None, 1.80, 1.50],
+            "Outcome": ["## Cardiovascular", "Hypertension", "Stroke", "## Metabolic", "Diabetes", "Obesity"],
+            "Effect Size": [None, 1.5, 1.2, None, 0.85, 1.2],
+            "Lower CI": [None, 1.2, 1.0, None, 0.7, 1.0],
+            "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
         }
     )
-    template_bytes = template_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 Download structured CSV template",
-        data=template_bytes,
-        file_name="forest_plot_template.csv",
-        mime="text/csv",
-    )
+    df = editable_table_with_row_ops(default_data, "manual_table_df")
 
-    uploaded_file = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx"])
-    if uploaded_file:
-        try:
-            # Reset stored table if a different file is uploaded
-            sig = (uploaded_file.name, uploaded_file.size)
-            if st.session_state.get("structured_file_sig") != sig:
-                st.session_state["structured_file_sig"] = sig
-                st.session_state.pop("structured_table_df", None)
-
-            if uploaded_file.name.endswith(".csv"):
-                df_loaded = pd.read_csv(uploaded_file)
-            else:
-                df_loaded = pd.read_excel(uploaded_file)
-
-            if not all(col in df_loaded.columns for col in REQUIRED_COLS):
-                st.error(f"Your file must include the following columns: {REQUIRED_COLS}")
-                df = None
-            else:
-                df = editable_table_with_deletion(df_loaded, "structured_table_df")
-        except Exception as e:
-            st.error(f"Error reading file: {e}")
-
-elif input_mode == "📄 Import TriNetX export table(s)":
-    st.subheader("Import TriNetX export tables")
-
+elif input_mode == "📄 Import TriNetX tables":
     uploaded_files = st.file_uploader(
         "Upload one or more TriNetX export tables (CSV/XLSX/DOCX)",
         type=["csv", "xlsx", "docx"],
@@ -325,18 +378,12 @@ elif input_mode == "📄 Import TriNetX export table(s)":
 
             effect_types = sorted(parsed["Effect Type"].unique().tolist())
             default_keep = [t for t in ["Risk Ratio", "Hazard Ratio"] if t in effect_types] or effect_types
-
-            keep_types = st.multiselect(
-                "Effect types to include in the plot table:",
-                options=effect_types,
-                default=default_keep,
-            )
+            keep_types = st.multiselect("Effect types to include:", options=effect_types, default=default_keep)
 
             plot_base = parsed[parsed["Effect Type"].isin(keep_types)].copy()
 
             append_type_when_needed = st.checkbox(
-                "Append effect type to Outcome label when the same outcome has multiple effect types",
-                value=True,
+                "Append effect type to Outcome label when the same outcome has multiple effect types", value=True
             )
             if append_type_when_needed and not plot_base.empty:
                 multi = plot_base.groupby("Outcome")["Effect Type"].nunique()
@@ -347,36 +394,27 @@ elif input_mode == "📄 Import TriNetX export table(s)":
                 )
 
             add_headers = st.checkbox("Insert section headers per uploaded table", value=False)
-            header_grouping = st.selectbox(
-                "Header grouping field",
-                options=["Source", "File"],
-                index=0,
-                disabled=not add_headers,
-            )
+            header_grouping = st.selectbox("Header grouping field", ["Source", "File"], index=0, disabled=not add_headers)
 
-            # Prepare editor table
-            plot_table = plot_base.copy()
             for c in REQUIRED_COLS:
-                if c not in plot_table.columns:
-                    plot_table[c] = None
+                if c not in plot_base.columns:
+                    plot_base[c] = None
             for c in ["Effect Size", "Lower CI", "Upper CI"]:
-                plot_table[c] = pd.to_numeric(plot_table[c], errors="coerce")
+                plot_base[c] = pd.to_numeric(plot_base[c], errors="coerce")
 
             if add_headers:
-                df_for_editor = insert_section_headers(plot_table, group_col=header_grouping)
+                df_for_editor = insert_section_headers(plot_base, group_col=header_grouping)
             else:
-                df_for_editor = plot_table[REQUIRED_COLS].copy()
+                df_for_editor = plot_base[REQUIRED_COLS].copy()
 
-            st.caption("Edit labels, add rows, or insert your own '##' section headers. Use the delete column to remove rows.")
-            df = editable_table_with_deletion(df_for_editor, "trinetx_import_table_df")
+            df = editable_table_with_row_ops(df_for_editor, "trinetx_import_table_df")
 
             with st.expander("Raw parsed rows (includes metadata)", expanded=False):
                 st.dataframe(parsed, use_container_width=True)
 
-            csv_bytes = plot_base.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "📥 Download parsed rows as CSV",
-                data=csv_bytes,
+                data=plot_base.to_csv(index=False).encode("utf-8"),
                 file_name="parsed_trinetx_effects.csv",
                 mime="text/csv",
             )
@@ -385,33 +423,61 @@ elif input_mode == "📄 Import TriNetX export table(s)":
     else:
         st.info("Upload one or more TriNetX export tables to parse effect sizes and confidence intervals.")
 
-else:
-    st.subheader("Manual entry")
+else:  # Upload structured file
+    st.subheader("Upload a structured file")
 
-    default_data = pd.DataFrame(
-        {
-            "Outcome": ["## Cardiovascular", "Hypertension", "Stroke", "## Metabolic", "Diabetes", "Obesity"],
-            "Effect Size": [None, 1.5, 1.2, None, 0.85, 1.2],
-            "Lower CI": [None, 1.2, 1.0, None, 0.7, 1.0],
-            "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
-        }
+    template_df = pd.DataFrame(
+        {"Outcome": ["## Cardiovascular", "Hypertension", "Stroke"], "Effect Size": [None, 1.50, 1.20],
+         "Lower CI": [None, 1.20, 1.00], "Upper CI": [None, 1.80, 1.50]}
     )
-    df = editable_table_with_deletion(default_data, "manual_table_df")
+    st.download_button(
+        "📥 Download structured CSV template",
+        data=template_df.to_csv(index=False).encode("utf-8"),
+        file_name="forest_plot_template.csv",
+        mime="text/csv",
+    )
+
+    uploaded_file = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx"])
+    if uploaded_file:
+        try:
+            sig = (uploaded_file.name, uploaded_file.size)
+            if st.session_state.get("structured_file_sig") != sig:
+                st.session_state["structured_file_sig"] = sig
+                st.session_state.pop("structured_table_df", None)
+
+            if uploaded_file.name.endswith(".csv"):
+                df_loaded = pd.read_csv(uploaded_file)
+            else:
+                df_loaded = pd.read_excel(uploaded_file)
+
+            if not all(col in df_loaded.columns for col in REQUIRED_COLS):
+                st.error(f"Your file must include columns: {REQUIRED_COLS}")
+                df = None
+            else:
+                df = editable_table_with_row_ops(df_loaded, "structured_table_df")
+        except Exception as e:
+            st.error(f"Error reading file: {e}")
 
 
 # ----------------------------
 # Plot controls + plot
 # ----------------------------
 if df is not None:
-    # Drop delete column for plotting logic
+    # Drop control columns
     plot_df = df.drop(columns=[DELETE_COL], errors="ignore").copy()
 
-    # Ensure required columns exist even if user pasted/edited
+    # Respect explicit ordering if present
+    if ORDER_COL in plot_df.columns:
+        plot_df[ORDER_COL] = pd.to_numeric(plot_df[ORDER_COL], errors="coerce")
+        plot_df = plot_df.sort_values(ORDER_COL, kind="mergesort")
+        plot_df = plot_df.drop(columns=[ORDER_COL], errors="ignore")
+
+    # Ensure required columns exist
     for c in REQUIRED_COLS:
         if c not in plot_df.columns:
             plot_df[c] = None
 
-    # Coerce numeric columns
+    # Coerce numeric cols
     for c in ["Effect Size", "Lower CI", "Upper CI"]:
         plot_df[c] = pd.to_numeric(plot_df[c], errors="coerce")
 
@@ -427,6 +493,12 @@ if df is not None:
         x_start = st.number_input("X-axis start", value=0.0, step=0.1, disabled=not use_custom_xlim)
         x_end = st.number_input("X-axis end", value=3.0, step=0.1, disabled=not use_custom_xlim)
 
+    with st.sidebar.expander("🧱 Top headroom & layout", expanded=False):
+        # This is the key new control for headroom between top row and title area.
+        top_headroom_rows = st.slider("Top headroom (rows)", 0.0, 6.0, 1.0, step=0.5)
+        bottom_padding_rows = st.slider("Bottom padding (rows)", 0.0, 6.0, 1.0, step=0.5)
+        title_pad_pts = st.slider("Title pad (points)", 0, 40, 12, step=2)
+
     with st.sidebar.expander("🎨 Advanced Visual Controls", expanded=False):
         color_scheme = st.selectbox("Color Scheme", ["Color", "Black & White"])
         point_size = st.slider("Marker Size", 6, 20, 10)
@@ -435,7 +507,6 @@ if df is not None:
         label_offset = st.slider("Label Horizontal Offset", 0.01, 0.3, 0.05)
         use_log = st.checkbox("Use Log Scale for X-axis", value=False)
         axis_padding = st.slider("X-axis Padding (%)", 2, 40, 10)
-        y_axis_padding = st.slider("Y-axis Padding (Rows)", 0.0, 5.0, 1.0, step=0.5)
         cap_height = st.slider("Tick Height (for CI ends)", 0.05, 0.5, 0.18, step=0.01)
 
         if color_scheme == "Color":
@@ -468,7 +539,7 @@ if df is not None:
 
         fig, ax = plt.subplots(figsize=(10, max(2.5, len(y_labels) * 0.7)))
 
-        # Determine x limits
+        # X limits
         if use_custom_xlim:
             if x_end <= x_start:
                 st.error("Custom X-axis end must be greater than start.")
@@ -478,10 +549,7 @@ if df is not None:
                 st.stop()
             ax.set_xlim(x_start, x_end)
         else:
-            ci_series = pd.concat(
-                [plot_df["Lower CI"].dropna(), plot_df["Upper CI"].dropna()],
-                ignore_index=True,
-            )
+            ci_series = pd.concat([plot_df["Lower CI"].dropna(), plot_df["Upper CI"].dropna()], ignore_index=True)
             if ci_series.empty:
                 st.error("No valid CI values found. Please check your table.")
                 st.stop()
@@ -499,7 +567,7 @@ if df is not None:
             x_pad = (x_max - x_min) * (axis_padding / 100)
             ax.set_xlim(x_min - x_pad, x_max + x_pad)
 
-        # Plot points and CI
+        # Plot
         for i, row in enumerate(rows):
             if row is None:
                 continue
@@ -531,9 +599,13 @@ if df is not None:
         else:
             ax.grid(False)
 
-        ax.set_ylim(len(y_labels) - 1 + y_axis_padding, -1 - y_axis_padding)
+        # Headroom control:
+        # With inverted y-axis, top space is controlled by the upper ylim bound (-1 - top_headroom_rows).
+        ax.set_ylim(len(y_labels) - 1 + bottom_padding_rows, -1 - top_headroom_rows)
+
         ax.set_xlabel(x_axis_label, fontsize=font_size)
-        ax.set_title(plot_title, fontsize=font_size + 2, weight="bold")
+        ax.set_title(plot_title, fontsize=font_size + 2, weight="bold", pad=title_pad_pts)
+
         fig.tight_layout()
 
         st.pyplot(fig)
