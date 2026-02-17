@@ -14,6 +14,51 @@ st.set_page_config(layout="wide")
 st.title("🌲 Novak's TriNetX Forest Plot Generator")
 
 REQUIRED_COLS = ["Outcome", "Effect Size", "Lower CI", "Upper CI"]
+DELETE_COL = "🗑 Delete"
+
+
+# ----------------------------
+# Row deletion helper
+# ----------------------------
+def editable_table_with_deletion(df_seed: pd.DataFrame, state_key: str):
+    """
+    Renders a data_editor with a delete-checkbox column and a delete button.
+    Uses st.session_state to persist edits/deletions across reruns.
+    """
+    if state_key not in st.session_state:
+        df0 = df_seed.copy()
+        if DELETE_COL not in df0.columns:
+            df0.insert(0, DELETE_COL, False)
+        st.session_state[state_key] = df0
+
+    # Ensure delete col exists even if seed schema changed
+    if DELETE_COL not in st.session_state[state_key].columns:
+        df_tmp = st.session_state[state_key].copy()
+        df_tmp.insert(0, DELETE_COL, False)
+        st.session_state[state_key] = df_tmp
+
+    edited = st.data_editor(
+        st.session_state[state_key],
+        num_rows="dynamic",
+        use_container_width=True,
+        key=f"editor_{state_key}",
+    )
+
+    # Persist edits
+    st.session_state[state_key] = edited
+
+    cols = st.columns([1, 6])
+    with cols[0]:
+        if st.button("🗑 Delete checked rows", key=f"delbtn_{state_key}"):
+            df_now = st.session_state[state_key].copy()
+            mask = df_now[DELETE_COL].fillna(False).astype(bool)
+            df_now = df_now.loc[~mask].copy()
+            if DELETE_COL in df_now.columns:
+                df_now[DELETE_COL] = False
+            st.session_state[state_key] = df_now
+            st.rerun()
+
+    return st.session_state[state_key]
 
 
 # ----------------------------
@@ -23,10 +68,6 @@ def _clean_line(s: str) -> str:
     if s is None:
         return ""
     s = str(s).strip()
-    # common TriNetX "blank" lines in CSV exports
-    if s in {'" "', '""', '"  "', '"\ufeff"', '" "'}:
-        return ""
-    # strip surrounding quotes if whole line is quoted
     if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
         s = s[1:-1]
     return s.strip()
@@ -45,34 +86,18 @@ def _to_float(x):
 
 
 def _extract_ci_from_string(s: str):
-    """
-    Handles strings like:
-      "0.61 [0.55, 0.67]"
-      "0.61 (0.55, 0.67)"
-      "0.61 0.55 0.67"
-    Returns (effect, lci, uci) or (None, None, None).
-    """
-    if not s:
-        return (None, None, None)
-    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", str(s))
+    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", str(s or ""))
     if len(nums) >= 3:
         return (_to_float(nums[0]), _to_float(nums[1]), _to_float(nums[2]))
     return (None, None, None)
 
 
 def _parse_section_effect(lines, section_name: str):
-    """
-    Finds one or more occurrences of a TriNetX section like:
-      Risk Ratio
-      Risk Ratio,95 % CI Lower,95 % CI Upper
-      0.68,0.62,0.75
-    Returns list of dicts with effect/lci/uci.
-    """
     results = []
     n = len(lines)
+
     for i, line in enumerate(lines):
         if _clean_line(line).lower() == section_name.lower():
-            # header line after the section title
             j = i + 1
             while j < n and _clean_line(lines[j]) == "":
                 j += 1
@@ -86,7 +111,6 @@ def _parse_section_effect(lines, section_name: str):
                 header = [header_line]
             header = [h.strip() for h in header if h is not None]
 
-            # value line after header
             k = j + 1
             while k < n and _clean_line(lines[k]) == "":
                 k += 1
@@ -100,7 +124,6 @@ def _parse_section_effect(lines, section_name: str):
                 vals = [value_line]
             vals = [v.strip() for v in vals]
 
-            # Identify indices for effect, lower CI, upper CI
             lower_idx = None
             upper_idx = None
             for idx, h in enumerate(header):
@@ -122,7 +145,6 @@ def _parse_section_effect(lines, section_name: str):
             lci = _to_float(vals[lower_idx]) if (lower_idx is not None and lower_idx < len(vals)) else None
             uci = _to_float(vals[upper_idx]) if (upper_idx is not None and upper_idx < len(vals)) else None
 
-            # Fallback: sometimes everything is in one column
             if eff is None or lci is None or uci is None:
                 eff2, lci2, uci2 = _extract_ci_from_string(" ".join(vals))
                 eff = eff if eff is not None else eff2
@@ -138,12 +160,7 @@ def _parse_section_effect(lines, section_name: str):
 
 
 def parse_trinetx_export_text(text: str, filename: str):
-    """
-    Parses TriNetX export content (CSV-ish multi-section files).
-    Extracts Risk Ratio / Hazard Ratio (and Odds Ratio if present).
-    Returns a dataframe with at least REQUIRED_COLS plus metadata cols.
-    """
-    lines = text.splitlines()
+    lines = (text or "").splitlines()
     if lines:
         lines[0] = lines[0].lstrip("\ufeff")
 
@@ -171,12 +188,6 @@ def parse_trinetx_export_text(text: str, filename: str):
 
 
 def parse_uploaded_trinetx_file(uploaded_file):
-    """
-    Supports:
-      - .csv: decode text and parse
-      - .xlsx: flattens sheets into pseudo-lines and parse
-      - .docx: best-effort (paragraphs + tables) and parse
-    """
     name = uploaded_file.name
     ext = name.split(".")[-1].lower()
 
@@ -185,7 +196,6 @@ def parse_uploaded_trinetx_file(uploaded_file):
         return parse_trinetx_export_text(raw, name)
 
     if ext == "xlsx":
-        # flatten each sheet into "lines" similar to the TriNetX CSV format
         xls = pd.ExcelFile(uploaded_file)
         flat_lines = []
         for sheet in xls.sheet_names:
@@ -197,37 +207,24 @@ def parse_uploaded_trinetx_file(uploaded_file):
         return parse_trinetx_export_text("\n".join(flat_lines), name)
 
     if ext == "docx":
-        try:
-            from docx import Document
-        except Exception as e:
-            st.error("DOCX parsing requires python-docx. Install it or export as CSV/XLSX.")
-            raise e
-
+        from docx import Document
         doc = Document(io.BytesIO(uploaded_file.getvalue()))
         lines = []
-
         for p in doc.paragraphs:
             t = p.text.strip()
             if t:
                 lines.append(t)
-
         for table in doc.tables:
             for row in table.rows:
                 cells = [c.text.strip() for c in row.cells]
                 if any(cells):
                     lines.append(",".join(cells))
-
         return parse_trinetx_export_text("\n".join(lines), name)
 
     return pd.DataFrame()
 
 
 def insert_section_headers(df: pd.DataFrame, group_col: str, header_prefix: str = "## "):
-    """
-    Inserts header rows like:
-      Outcome = "## <group value>"
-      Effect/CI cells are None
-    """
     if df.empty or group_col not in df.columns:
         return df
 
@@ -254,21 +251,50 @@ input_mode = st.radio(
 df = None
 
 if input_mode == "📤 Upload structured file":
+    st.subheader("Upload a structured file")
+
+    # Template download
+    template_df = pd.DataFrame(
+        {
+            "Outcome": ["## Cardiovascular", "Hypertension", "Stroke"],
+            "Effect Size": [None, 1.50, 1.20],
+            "Lower CI": [None, 1.20, 1.00],
+            "Upper CI": [None, 1.80, 1.50],
+        }
+    )
+    template_bytes = template_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Download structured CSV template",
+        data=template_bytes,
+        file_name="forest_plot_template.csv",
+        mime="text/csv",
+    )
+
     uploaded_file = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx"])
     if uploaded_file:
         try:
-            if uploaded_file.name.endswith(".csv"):
-                df = pd.read_csv(uploaded_file)
-            else:
-                df = pd.read_excel(uploaded_file)
+            # Reset stored table if a different file is uploaded
+            sig = (uploaded_file.name, uploaded_file.size)
+            if st.session_state.get("structured_file_sig") != sig:
+                st.session_state["structured_file_sig"] = sig
+                st.session_state.pop("structured_table_df", None)
 
-            if not all(col in df.columns for col in REQUIRED_COLS):
+            if uploaded_file.name.endswith(".csv"):
+                df_loaded = pd.read_csv(uploaded_file)
+            else:
+                df_loaded = pd.read_excel(uploaded_file)
+
+            if not all(col in df_loaded.columns for col in REQUIRED_COLS):
                 st.error(f"Your file must include the following columns: {REQUIRED_COLS}")
                 df = None
+            else:
+                df = editable_table_with_deletion(df_loaded, "structured_table_df")
         except Exception as e:
             st.error(f"Error reading file: {e}")
 
 elif input_mode == "📄 Import TriNetX export table(s)":
+    st.subheader("Import TriNetX export tables")
+
     uploaded_files = st.file_uploader(
         "Upload one or more TriNetX export tables (CSV/XLSX/DOCX)",
         type=["csv", "xlsx", "docx"],
@@ -298,9 +324,7 @@ elif input_mode == "📄 Import TriNetX export table(s)":
             parsed = pd.concat(parsed_frames, ignore_index=True)
 
             effect_types = sorted(parsed["Effect Type"].unique().tolist())
-            default_keep = [t for t in ["Risk Ratio", "Hazard Ratio"] if t in effect_types]
-            if not default_keep:
-                default_keep = effect_types
+            default_keep = [t for t in ["Risk Ratio", "Hazard Ratio"] if t in effect_types] or effect_types
 
             keep_types = st.multiselect(
                 "Effect types to include in the plot table:",
@@ -308,20 +332,17 @@ elif input_mode == "📄 Import TriNetX export table(s)":
                 default=default_keep,
             )
 
-            # Filter down to plot candidates
             plot_base = parsed[parsed["Effect Type"].isin(keep_types)].copy()
 
             append_type_when_needed = st.checkbox(
-                "Append effect type to the Outcome label when an outcome has multiple effect types",
+                "Append effect type to Outcome label when the same outcome has multiple effect types",
                 value=True,
             )
             if append_type_when_needed and not plot_base.empty:
                 multi = plot_base.groupby("Outcome")["Effect Type"].nunique()
                 multi_outcomes = set(multi[multi > 1].index)
                 plot_base["Outcome"] = plot_base.apply(
-                    lambda r: f"{r['Outcome']} ({r['Effect Type']})"
-                    if r["Outcome"] in multi_outcomes
-                    else r["Outcome"],
+                    lambda r: f"{r['Outcome']} ({r['Effect Type']})" if r["Outcome"] in multi_outcomes else r["Outcome"],
                     axis=1,
                 )
 
@@ -333,36 +354,25 @@ elif input_mode == "📄 Import TriNetX export table(s)":
                 disabled=not add_headers,
             )
 
-            # This is the editable table that drives the plot:
+            # Prepare editor table
             plot_table = plot_base.copy()
-
-            # Ensure required columns exist
             for c in REQUIRED_COLS:
                 if c not in plot_table.columns:
                     plot_table[c] = None
-
-            # Coerce numeric columns
             for c in ["Effect Size", "Lower CI", "Upper CI"]:
                 plot_table[c] = pd.to_numeric(plot_table[c], errors="coerce")
 
-            # If headers requested, build a REQUIRED_COLS-only table with header rows
             if add_headers:
                 df_for_editor = insert_section_headers(plot_table, group_col=header_grouping)
             else:
                 df_for_editor = plot_table[REQUIRED_COLS].copy()
 
-            st.caption("You can edit labels, add rows, or insert your own '##' section headers below.")
-            df = st.data_editor(
-                df_for_editor,
-                num_rows="dynamic",
-                use_container_width=True,
-                key="trinetx_import_table",
-            )
+            st.caption("Edit labels, add rows, or insert your own '##' section headers. Use the delete column to remove rows.")
+            df = editable_table_with_deletion(df_for_editor, "trinetx_import_table_df")
 
             with st.expander("Raw parsed rows (includes metadata)", expanded=False):
                 st.dataframe(parsed, use_container_width=True)
 
-            # Optional: download the parsed table
             csv_bytes = plot_base.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "📥 Download parsed rows as CSV",
@@ -372,8 +382,12 @@ elif input_mode == "📄 Import TriNetX export table(s)":
             )
         else:
             st.info("No parsable TriNetX effect sections were found in the uploaded files.")
+    else:
+        st.info("Upload one or more TriNetX export tables to parse effect sizes and confidence intervals.")
 
 else:
+    st.subheader("Manual entry")
+
     default_data = pd.DataFrame(
         {
             "Outcome": ["## Cardiovascular", "Hypertension", "Stroke", "## Metabolic", "Diabetes", "Obesity"],
@@ -382,21 +396,24 @@ else:
             "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
         }
     )
-    df = st.data_editor(default_data, num_rows="dynamic", use_container_width=True, key="manual_input_table")
+    df = editable_table_with_deletion(default_data, "manual_table_df")
 
 
 # ----------------------------
 # Plot controls + plot
 # ----------------------------
 if df is not None:
+    # Drop delete column for plotting logic
+    plot_df = df.drop(columns=[DELETE_COL], errors="ignore").copy()
+
     # Ensure required columns exist even if user pasted/edited
     for c in REQUIRED_COLS:
-        if c not in df.columns:
-            df[c] = None
+        if c not in plot_df.columns:
+            plot_df[c] = None
 
     # Coerce numeric columns
     for c in ["Effect Size", "Lower CI", "Upper CI"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        plot_df[c] = pd.to_numeric(plot_df[c], errors="coerce")
 
     st.sidebar.header("⚙️ Basic Plot Settings")
     plot_title = st.sidebar.text_input("Plot Title", value="Forest Plot")
@@ -404,6 +421,11 @@ if df is not None:
     show_grid = st.sidebar.checkbox("Show Grid", value=True)
     show_values = st.sidebar.checkbox("Show Numerical Annotations", value=False)
     use_groups = st.sidebar.checkbox("Treat rows starting with '##' as section headers", value=True)
+
+    with st.sidebar.expander("📏 X-axis range controls", expanded=False):
+        use_custom_xlim = st.checkbox("Use custom X-axis start/end", value=False)
+        x_start = st.number_input("X-axis start", value=0.0, step=0.1, disabled=not use_custom_xlim)
+        x_end = st.number_input("X-axis end", value=3.0, step=0.1, disabled=not use_custom_xlim)
 
     with st.sidebar.expander("🎨 Advanced Visual Controls", expanded=False):
         color_scheme = st.selectbox("Color Scheme", ["Color", "Black & White"])
@@ -430,7 +452,7 @@ if df is not None:
         indent = "\u00A0" * 4
         group_mode = False
 
-        for _, row in df.iterrows():
+        for _, row in plot_df.iterrows():
             outcome_val = row.get("Outcome", "")
             if use_groups and isinstance(outcome_val, str) and outcome_val.startswith("##"):
                 header = outcome_val[2:].lstrip("#").strip()
@@ -446,30 +468,38 @@ if df is not None:
 
         fig, ax = plt.subplots(figsize=(10, max(2.5, len(y_labels) * 0.7)))
 
-        # Axis limits with padding (robust to empty)
-        ci_series = pd.concat([df["Lower CI"].dropna(), df["Upper CI"].dropna()], ignore_index=True)
-        if ci_series.empty:
-            st.error("No valid CI values found. Please check your table.")
-            st.stop()
-
-        x_min, x_max = ci_series.min(), ci_series.max()
-
-        if use_log:
-            # log scale requires positive bounds
-            positive = ci_series[ci_series > 0]
-            if positive.empty:
-                st.error("Log scale requires positive effect sizes and CI bounds.")
+        # Determine x limits
+        if use_custom_xlim:
+            if x_end <= x_start:
+                st.error("Custom X-axis end must be greater than start.")
                 st.stop()
-            x_min, x_max = positive.min(), positive.max()
+            if use_log and (x_start <= 0 or x_end <= 0):
+                st.error("Log scale requires positive X-axis limits.")
+                st.stop()
+            ax.set_xlim(x_start, x_end)
+        else:
+            ci_series = pd.concat(
+                [plot_df["Lower CI"].dropna(), plot_df["Upper CI"].dropna()],
+                ignore_index=True,
+            )
+            if ci_series.empty:
+                st.error("No valid CI values found. Please check your table.")
+                st.stop()
 
-        if x_min == x_max:
-            x_min = x_min * 0.9
-            x_max = x_max * 1.1
+            if use_log:
+                ci_series = ci_series[ci_series > 0]
+                if ci_series.empty:
+                    st.error("Log scale requires positive effect sizes and CI bounds.")
+                    st.stop()
 
-        x_pad = (x_max - x_min) * (axis_padding / 100)
-        ax.set_xlim(x_min - x_pad, x_max + x_pad)
+            x_min, x_max = ci_series.min(), ci_series.max()
+            if x_min == x_max:
+                x_min = x_min * 0.9
+                x_max = x_max * 1.1
+            x_pad = (x_max - x_min) * (axis_padding / 100)
+            ax.set_xlim(x_min - x_pad, x_max + x_pad)
 
-        # Plot
+        # Plot points and CI
         for i, row in enumerate(rows):
             if row is None:
                 continue
