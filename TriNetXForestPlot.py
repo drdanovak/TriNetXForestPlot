@@ -18,37 +18,37 @@ ORDER_COL = "↕ Order"
 
 
 # ----------------------------
-# Table helpers: order + insert + move + delete
+# Table helpers: order + insert + move + delete (FIXED)
 # ----------------------------
 def _normalize_table(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     # Ensure control columns exist
-    if ORDER_COL not in df.columns:
-        df.insert(0, ORDER_COL, list(range(1, len(df) + 1)))
     if DELETE_COL not in df.columns:
         df.insert(0, DELETE_COL, False)
+    if ORDER_COL not in df.columns:
+        df.insert(0, ORDER_COL, list(range(1, len(df) + 1)))
 
-    # Coerce order to numeric, fill missing
+    # Normalize types
+    df[DELETE_COL] = df[DELETE_COL].fillna(False).astype(bool)
     df[ORDER_COL] = pd.to_numeric(df[ORDER_COL], errors="coerce")
+
+    # Fill missing ORDER values at the end (preserve appearance)
     if df[ORDER_COL].isna().any():
         max_order = df[ORDER_COL].max(skipna=True)
-        max_order = 0 if pd.isna(max_order) else int(max_order)
-        na_idx = df[df[ORDER_COL].isna()].index.tolist()
+        max_order = 0 if pd.isna(max_order) else float(max_order)
+        na_idx = df.index[df[ORDER_COL].isna()].tolist()
         for k, idx in enumerate(na_idx, start=1):
             df.loc[idx, ORDER_COL] = max_order + k
 
-    # Normalize delete col
-    df[DELETE_COL] = df[DELETE_COL].fillna(False).astype(bool)
-
-    # Sort by order and re-number sequentially (stable)
+    # Sort by ORDER (stable), then re-number sequentially
     df = df.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
     df[ORDER_COL] = range(1, len(df) + 1)
+
     return df
 
 
 def _blank_row_for(df: pd.DataFrame) -> dict:
-    # Create a blank row matching df's columns
     row = {}
     for c in df.columns:
         if c == DELETE_COL:
@@ -63,89 +63,102 @@ def _blank_row_for(df: pd.DataFrame) -> dict:
 
 
 def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
-    """
-    Data editor + row ops:
-      - move row up/down
-      - insert blank row above/below
-      - delete checked rows
-    Uses session_state to persist.
-    """
     if state_key not in st.session_state:
         st.session_state[state_key] = _normalize_table(df_seed)
 
-    # Always normalize before showing
+    # Normalize before display
     st.session_state[state_key] = _normalize_table(st.session_state[state_key])
+    df_now = st.session_state[state_key]
 
     # Editor
     edited = st.data_editor(
-        st.session_state[state_key],
+        df_now,
         num_rows="dynamic",
         use_container_width=True,
         key=f"editor_{state_key}",
+        column_config={
+            ORDER_COL: st.column_config.NumberColumn(
+                ORDER_COL,
+                help="Row order. You can type numbers here, or use the buttons below.",
+                step=1,
+            ),
+            DELETE_COL: st.column_config.CheckboxColumn(DELETE_COL, help="Mark rows to delete"),
+        },
     )
 
-    # Persist edits and normalize again (handles newly added rows)
-    st.session_state[state_key] = _normalize_table(edited)
-
+    # Persist edits; do NOT clear delete checks here (let user decide)
+    st.session_state[state_key] = edited
     df_now = st.session_state[state_key]
 
-    # Row ops UI
-    st.caption("Row tools: move, insert between, delete. (Use the order column or buttons below.)")
+    st.caption(
+        "Row tools: select a row, then move it or insert a blank row above/below. "
+        "(Deletion uses the checkbox column.)"
+    )
+
     if len(df_now) == 0:
         return df_now
 
+    # Build labels from current visible order (sorted by ORDER_COL, stable)
+    df_view = df_now.copy()
+    df_view[ORDER_COL] = pd.to_numeric(df_view[ORDER_COL], errors="coerce")
+    df_view = df_view.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
+
     labels = []
-    for i in range(len(df_now)):
-        outcome = df_now.loc[i, "Outcome"] if "Outcome" in df_now.columns else ""
+    for i in range(len(df_view)):
+        outcome = df_view.loc[i, "Outcome"] if "Outcome" in df_view.columns else ""
         outcome = "" if pd.isna(outcome) else str(outcome)
         labels.append(f"{i+1}: {outcome[:60]}")
 
-    cols = st.columns([3, 1, 1, 1, 1, 2])
-    with cols[0]:
+    c = st.columns([3, 1, 1, 1, 1, 2])
+    with c[0]:
         selected = st.selectbox("Select row", options=labels, key=f"sel_{state_key}")
         sel_idx = int(selected.split(":")[0]) - 1
 
-    def commit(new_df):
-        st.session_state[state_key] = _normalize_table(new_df)
+    def commit(df_commit: pd.DataFrame):
+        st.session_state[state_key] = _normalize_table(df_commit)
         st.rerun()
 
-    with cols[1]:
+    curr_order = float(pd.to_numeric(df_view.loc[sel_idx, ORDER_COL], errors="coerce"))
+
+    # Apply operations by modifying ORDER_COL (this survives normalization)
+    with c[1]:
         if st.button("⬆️ Up", key=f"up_{state_key}", disabled=(sel_idx <= 0)):
-            new_df = df_now.copy()
-            # swap sel_idx with sel_idx-1 by moving
-            row = new_df.iloc[[sel_idx]].copy()
-            new_df = new_df.drop(new_df.index[sel_idx]).reset_index(drop=True)
-            new_df = pd.concat([new_df.iloc[: sel_idx - 1], row, new_df.iloc[sel_idx - 1 :]], ignore_index=True)
-            commit(new_df)
+            above_order = float(pd.to_numeric(df_view.loc[sel_idx - 1, ORDER_COL], errors="coerce"))
+            df_view2 = df_view.copy()
+            df_view2.loc[sel_idx, ORDER_COL] = above_order
+            df_view2.loc[sel_idx - 1, ORDER_COL] = curr_order
+            commit(df_view2)
 
-    with cols[2]:
-        if st.button("⬇️ Down", key=f"down_{state_key}", disabled=(sel_idx >= len(df_now) - 1)):
-            new_df = df_now.copy()
-            row = new_df.iloc[[sel_idx]].copy()
-            new_df = new_df.drop(new_df.index[sel_idx]).reset_index(drop=True)
-            new_df = pd.concat([new_df.iloc[: sel_idx + 1], row, new_df.iloc[sel_idx + 1 :]], ignore_index=True)
-            commit(new_df)
+    with c[2]:
+        if st.button("⬇️ Down", key=f"down_{state_key}", disabled=(sel_idx >= len(df_view) - 1)):
+            below_order = float(pd.to_numeric(df_view.loc[sel_idx + 1, ORDER_COL], errors="coerce"))
+            df_view2 = df_view.copy()
+            df_view2.loc[sel_idx, ORDER_COL] = below_order
+            df_view2.loc[sel_idx + 1, ORDER_COL] = curr_order
+            commit(df_view2)
 
-    with cols[3]:
+    with c[3]:
         if st.button("➕ Above", key=f"ins_above_{state_key}"):
-            new_df = df_now.copy()
-            blank = pd.DataFrame([_blank_row_for(new_df)])
-            new_df = pd.concat([new_df.iloc[:sel_idx], blank, new_df.iloc[sel_idx:]], ignore_index=True)
-            commit(new_df)
+            df_view2 = df_view.copy()
+            new_row = _blank_row_for(df_view2)
+            new_row[ORDER_COL] = curr_order - 0.5  # places it just above after sorting
+            df_view2 = pd.concat([df_view2, pd.DataFrame([new_row])], ignore_index=True)
+            commit(df_view2)
 
-    with cols[4]:
+    with c[4]:
         if st.button("➕ Below", key=f"ins_below_{state_key}"):
-            new_df = df_now.copy()
-            blank = pd.DataFrame([_blank_row_for(new_df)])
-            new_df = pd.concat([new_df.iloc[: sel_idx + 1], blank, new_df.iloc[sel_idx + 1 :]], ignore_index=True)
-            commit(new_df)
+            df_view2 = df_view.copy()
+            new_row = _blank_row_for(df_view2)
+            new_row[ORDER_COL] = curr_order + 0.5  # places it just below after sorting
+            df_view2 = pd.concat([df_view2, pd.DataFrame([new_row])], ignore_index=True)
+            commit(df_view2)
 
-    with cols[5]:
+    with c[5]:
         if st.button("🗑 Delete checked", key=f"del_{state_key}"):
-            new_df = df_now.copy()
-            mask = new_df[DELETE_COL].fillna(False).astype(bool)
-            new_df = new_df.loc[~mask].copy().reset_index(drop=True)
-            commit(new_df)
+            df_commit = df_now.copy()
+            mask = df_commit[DELETE_COL].fillna(False).astype(bool)
+            df_commit = df_commit.loc[~mask].copy().reset_index(drop=True)
+            commit(df_commit)
 
     return st.session_state[state_key]
 
@@ -241,7 +254,9 @@ def _parse_section_effect(lines, section_name: str):
                 uci = uci if uci is not None else uci2
 
             if eff is not None and lci is not None and uci is not None:
-                results.append({"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci})
+                results.append(
+                    {"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci}
+                )
 
     return results
 
@@ -318,7 +333,9 @@ def insert_section_headers(df: pd.DataFrame, group_col: str, header_prefix: str 
 
     out_rows = []
     for g, sub in df.groupby(group_col, sort=False):
-        out_rows.append({"Outcome": f"{header_prefix}{g}", "Effect Size": None, "Lower CI": None, "Upper CI": None})
+        out_rows.append(
+            {"Outcome": f"{header_prefix}{g}", "Effect Size": None, "Lower CI": None, "Upper CI": None}
+        )
         out_rows.extend(sub[REQUIRED_COLS].to_dict("records"))
 
     return pd.DataFrame(out_rows)
@@ -409,7 +426,7 @@ elif input_mode == "📄 Import TriNetX tables":
 
             df = editable_table_with_row_ops(df_for_editor, "trinetx_import_table_df")
 
-            with st.expander("Raw parsed rows (includes metadata)", expanded=False):
+            with st.expander("Extracted Data", expanded=False):
                 st.dataframe(parsed, use_container_width=True)
 
             st.download_button(
@@ -427,8 +444,12 @@ else:  # Upload structured file
     st.subheader("Upload a structured file")
 
     template_df = pd.DataFrame(
-        {"Outcome": ["## Cardiovascular", "Hypertension", "Stroke"], "Effect Size": [None, 1.50, 1.20],
-         "Lower CI": [None, 1.20, 1.00], "Upper CI": [None, 1.80, 1.50]}
+        {
+            "Outcome": ["## Cardiovascular", "Hypertension", "Stroke"],
+            "Effect Size": [None, 1.50, 1.20],
+            "Lower CI": [None, 1.20, 1.00],
+            "Upper CI": [None, 1.80, 1.50],
+        }
     )
     st.download_button(
         "📥 Download structured CSV template",
@@ -470,7 +491,7 @@ if df is not None:
     if ORDER_COL in plot_df.columns:
         plot_df[ORDER_COL] = pd.to_numeric(plot_df[ORDER_COL], errors="coerce")
         plot_df = plot_df.sort_values(ORDER_COL, kind="mergesort")
-        plot_df = plot_df.drop(columns=[ORDER_COL], errors="ignore")
+        plot_df = plot_df.drop(columns=[ORDER_COL], errors="ignore").reset_index(drop=True)
 
     # Ensure required columns exist
     for c in REQUIRED_COLS:
@@ -494,7 +515,6 @@ if df is not None:
         x_end = st.number_input("X-axis end", value=3.0, step=0.1, disabled=not use_custom_xlim)
 
     with st.sidebar.expander("🧱 Top headroom & layout", expanded=False):
-        # This is the key new control for headroom between top row and title area.
         top_headroom_rows = st.slider("Top headroom (rows)", 0.0, 6.0, 1.0, step=0.5)
         bottom_padding_rows = st.slider("Bottom padding (rows)", 0.0, 6.0, 1.0, step=0.5)
         title_pad_pts = st.slider("Title pad (points)", 0, 40, 12, step=2)
@@ -599,8 +619,7 @@ if df is not None:
         else:
             ax.grid(False)
 
-        # Headroom control:
-        # With inverted y-axis, top space is controlled by the upper ylim bound (-1 - top_headroom_rows).
+        # Headroom control
         ax.set_ylim(len(y_labels) - 1 + bottom_padding_rows, -1 - top_headroom_rows)
 
         ax.set_xlabel(x_axis_label, fontsize=font_size)
