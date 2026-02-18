@@ -42,7 +42,7 @@ DEFAULTS = dict(
     plot_title="Forest Plot",
     x_axis_label="Effect Size (RR / OR / HR)",
     ref_line=1.0,
-    ref_line_label=" ",
+    ref_line_label="Null (1.0)",
     point_size=10,
     line_width=2,
     font_size=12,
@@ -114,7 +114,6 @@ def _blank_row_for(df: pd.DataFrame) -> dict:
 def editable_table_with_row_ops(
     df_seed: pd.DataFrame,
     state_key: str,
-    tools_expanded_default: bool = False,
 ):
     if state_key not in st.session_state:
         st.session_state[state_key] = _normalize_table(df_seed)
@@ -164,70 +163,153 @@ def editable_table_with_row_ops(
 
     df_view = df_now.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
 
-    with st.expander("Row tools  (move / insert / header / delete)", expanded=tools_expanded_default):
-        top = st.columns([2.2, 3.8, 1.2, 1.2, 1.4, 1.4, 1.6])
+    def commit(df_commit: pd.DataFrame):
+        st.session_state[state_key] = _normalize_table(df_commit)
+        st.rerun()
 
-        with top[0]:
-            row_num = st.number_input(
-                "Row #",
-                min_value=1,
-                max_value=len(df_view),
-                value=1,
-                step=1,
-                key=f"rownum_{state_key}",
-            )
-            sel_idx = int(row_num) - 1
+    with st.expander("✏️ Row tools", expanded=True):
 
-        with top[1]:
-            o = df_view.loc[sel_idx, "Outcome"]
-            o = "" if pd.isna(o) else str(o)
-            is_hdr = bool(df_view.loc[sel_idx, HEADER_COL])
-            es = df_view.loc[sel_idx, "Effect Size"]
-            lci = df_view.loc[sel_idx, "Lower CI"]
-            uci = df_view.loc[sel_idx, "Upper CI"]
-            if is_hdr:
-                st.write(f"Selected: **HEADER** → {o}")
-            else:
-                st.write(f"Selected: {o}")
-                st.write(f"Effect / CI: {es}  |  {lci} – {uci}")
+        # ── Row selector: searchable dropdown showing outcome labels ──────────
+        def _row_label(i: int) -> str:
+            o = df_view.loc[i, "Outcome"]
+            o = "" if pd.isna(o) else str(o).strip()
+            is_hdr = bool(df_view.loc[i, HEADER_COL])
+            prefix = f"{i + 1}."
+            tag = "  [header]" if is_hdr else ""
+            return f"{prefix}  {o}{tag}" if o else f"{prefix}  (empty)"
 
-        def commit(df_commit: pd.DataFrame):
-            st.session_state[state_key] = _normalize_table(df_commit)
-            st.rerun()
+        options = [_row_label(i) for i in range(len(df_view))]
 
+        # Preserve last selection across reruns so moving a row keeps it selected
+        sel_key = f"sel_row_{state_key}"
+        prev_label = st.session_state.get(sel_key, options[0])
+        # If the previously selected label no longer exists (e.g. after delete),
+        # fall back to the first option.
+        default_idx = options.index(prev_label) if prev_label in options else 0
+
+        selected_label = st.selectbox(
+            "Select row to act on:",
+            options=options,
+            index=default_idx,
+            key=f"selectbox_{state_key}",
+        )
+        st.session_state[sel_key] = selected_label
+        sel_idx = options.index(selected_label)
         curr_order = float(pd.to_numeric(df_view.loc[sel_idx, ORDER_COL], errors="coerce"))
 
-        with top[2]:
-            if st.button("⬆️ Up", key=f"up_{state_key}", use_container_width=True, disabled=(sel_idx <= 0)):
+        # ── Move buttons: large, clear, side-by-side ─────────────────────────
+        st.markdown("**Move**")
+        mv1, mv2, mv3, mv4 = st.columns(4)
+
+        with mv1:
+            if st.button(
+                "⬆️ Up one",
+                key=f"up_{state_key}",
+                use_container_width=True,
+                disabled=(sel_idx <= 0),
+            ):
                 df2 = df_view.copy()
                 ab = float(pd.to_numeric(df2.loc[sel_idx - 1, ORDER_COL], errors="coerce"))
                 df2.loc[sel_idx, ORDER_COL] = ab
                 df2.loc[sel_idx - 1, ORDER_COL] = curr_order
+                # Keep selection on the same row after move
+                st.session_state[sel_key] = _row_label(sel_idx - 1).replace(
+                    f"{sel_idx}.", f"{sel_idx}."
+                )
                 commit(df2)
 
-        with top[3]:
-            if st.button("⬇️ Down", key=f"down_{state_key}", use_container_width=True, disabled=(sel_idx >= len(df_view) - 1)):
+        with mv2:
+            if st.button(
+                "⬇️ Down one",
+                key=f"down_{state_key}",
+                use_container_width=True,
+                disabled=(sel_idx >= len(df_view) - 1),
+            ):
                 df2 = df_view.copy()
                 bl = float(pd.to_numeric(df2.loc[sel_idx + 1, ORDER_COL], errors="coerce"))
                 df2.loc[sel_idx, ORDER_COL] = bl
                 df2.loc[sel_idx + 1, ORDER_COL] = curr_order
                 commit(df2)
 
-        with top[4]:
-            if st.button("➕ Above", key=f"ins_above_{state_key}", use_container_width=True):
+        with mv3:
+            if st.button(
+                "⏫ To top",
+                key=f"top_{state_key}",
+                use_container_width=True,
+                disabled=(sel_idx <= 0),
+            ):
+                df2 = df_view.copy()
+                df2.loc[sel_idx, ORDER_COL] = 0.0
+                commit(df2)
+
+        with mv4:
+            if st.button(
+                "⏬ To bottom",
+                key=f"bot_{state_key}",
+                use_container_width=True,
+                disabled=(sel_idx >= len(df_view) - 1),
+            ):
+                df2 = df_view.copy()
+                df2.loc[sel_idx, ORDER_COL] = float(len(df_view)) + 1
+                commit(df2)
+
+        # ── Move to specific position ─────────────────────────────────────────
+        mc1, mc2 = st.columns([2, 3])
+        with mc1:
+            move_to = st.number_input(
+                "Move to position #",
+                min_value=1,
+                max_value=len(df_view),
+                value=sel_idx + 1,
+                step=1,
+                key=f"moveto_{state_key}",
+            )
+        with mc2:
+            st.write("")
+            st.write("")
+            if st.button("↩️ Move to position", key=f"moveto_btn_{state_key}", use_container_width=True):
+                df2 = df_view.copy()
+                target_idx = int(move_to) - 1
+                # Insert the row at target_idx by slotting its order between neighbours
+                if target_idx <= 0:
+                    new_order = float(pd.to_numeric(df2.loc[0, ORDER_COL], errors="coerce")) - 1
+                elif target_idx >= len(df2) - 1:
+                    new_order = float(pd.to_numeric(df2.loc[len(df2) - 1, ORDER_COL], errors="coerce")) + 1
+                else:
+                    before = float(pd.to_numeric(df2.loc[target_idx - 1, ORDER_COL], errors="coerce"))
+                    after = float(pd.to_numeric(df2.loc[target_idx, ORDER_COL], errors="coerce"))
+                    new_order = (before + after) / 2
+                df2.loc[sel_idx, ORDER_COL] = new_order
+                commit(df2)
+
+        st.divider()
+
+        # ── Insert / header / delete ──────────────────────────────────────────
+        act1, act2, act3, act4, act5 = st.columns(5)
+
+        with act1:
+            if st.button("➕ Insert above", key=f"ins_above_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
                 nr = _blank_row_for(df2)
                 nr[ORDER_COL] = curr_order - 0.5
                 commit(pd.concat([df2, pd.DataFrame([nr])], ignore_index=True))
 
-        with top[5]:
-            if st.button("➕ Below", key=f"ins_below_{state_key}", use_container_width=True):
+        with act2:
+            if st.button("➕ Insert below", key=f"ins_below_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
                 nr = _blank_row_for(df2)
                 nr[ORDER_COL] = curr_order + 0.5
                 commit(pd.concat([df2, pd.DataFrame([nr])], ignore_index=True))
 
-        with top[6]:
+        with act3:
+            if st.button("➕ Add header below", key=f"add_hdr_below_{state_key}", use_container_width=True):
+                df2 = df_view.copy()
+                nr = _blank_row_for(df2)
+                nr[HEADER_COL] = True
+                nr[ORDER_COL] = curr_order + 0.5
+                commit(pd.concat([df2, pd.DataFrame([nr])], ignore_index=True))
+
+        with act4:
             if st.button("🅷 Toggle header", key=f"toggle_hdr_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
                 new_val = not bool(df2.loc[sel_idx, HEADER_COL])
@@ -236,31 +318,26 @@ def editable_table_with_row_ops(
                     df2.loc[sel_idx, ["Effect Size", "Lower CI", "Upper CI"]] = None
                 commit(df2)
 
-        bottom = st.columns([2.0, 2.0, 3.0, 3.0])
-
-        with bottom[0]:
-            if st.button("🗑 Delete selected", key=f"del_sel_{state_key}", use_container_width=True):
+        with act5:
+            if st.button(
+                "🗑 Delete selected",
+                key=f"del_sel_{state_key}",
+                use_container_width=True,
+                type="primary",
+            ):
                 commit(df_view.drop(index=sel_idx).reset_index(drop=True))
 
-        with bottom[1]:
-            if st.button("🗑 Delete checked", key=f"del_checked_{state_key}", use_container_width=True):
+        del_col1, del_col2 = st.columns(2)
+        with del_col1:
+            if st.button("🗑 Delete all checked rows", key=f"del_checked_{state_key}", use_container_width=True):
                 df2 = df_now.copy()
                 df2 = df2.loc[~df2[DELETE_COL].fillna(False).astype(bool)].reset_index(drop=True)
                 commit(df2)
-
-        with bottom[2]:
+        with del_col2:
             if st.button("✅ Clear delete checks", key=f"clear_del_{state_key}", use_container_width=True):
                 df2 = df_now.copy()
                 df2[DELETE_COL] = False
                 commit(df2)
-
-        with bottom[3]:
-            if st.button("➕ Add header below", key=f"add_hdr_below_{state_key}", use_container_width=True):
-                df2 = df_view.copy()
-                nr = _blank_row_for(df2)
-                nr[HEADER_COL] = True
-                nr[ORDER_COL] = curr_order + 0.5
-                commit(pd.concat([df2, pd.DataFrame([nr])], ignore_index=True))
 
     return st.session_state[state_key]
 
@@ -905,40 +982,49 @@ if df is not None:
             st.pyplot(st.session_state["last_fig"], use_container_width=False)
 
     # ── Download ─────────────────────────────────────────────────────────────
+    # Download buttons are rendered lazily: we only build the bytes when the
+    # user explicitly clicks "Prepare downloads", avoiding eager evaluation
+    # errors and unnecessary re-renders on every page load.
     st.markdown("#### 💾 Download plot")
+
+    if st.button("🖨️ Prepare downloads", help="Renders the plot at export quality so the download buttons are ready."):
+        try:
+            with st.spinner("Rendering export…"):
+                for fmt, mime, fname in [
+                    ("PNG", "image/png", "forest_plot.png"),
+                    ("SVG", "image/svg+xml", "forest_plot.svg"),
+                    ("PDF", "application/pdf", "forest_plot.pdf"),
+                ]:
+                    fig_exp = build_forest_plot(plot_df, cfg)
+                    buf = io.BytesIO()
+                    fig_exp.savefig(
+                        buf,
+                        format=fmt.lower(),
+                        dpi=export_dpi if fmt == "PNG" else None,
+                        bbox_inches="tight",
+                    )
+                    plt.close(fig_exp)
+                    st.session_state[f"dl_bytes_{fmt}"] = buf.getvalue()
+                    st.session_state[f"dl_mime_{fmt}"] = mime
+                    st.session_state[f"dl_fname_{fmt}"] = fname
+        except ValueError as e:
+            st.error(str(e))
+
     dl_col1, dl_col2, dl_col3 = st.columns(3)
-
-    def _render_to_bytes(fmt: str, dpi: int) -> bytes:
-        fig2 = build_forest_plot(plot_df, cfg)
-        buf = io.BytesIO()
-        fig2.savefig(buf, format=fmt.lower(), dpi=dpi if fmt == "PNG" else None, bbox_inches="tight")
-        plt.close(fig2)
-        return buf.getvalue()
-
-    mime_map = {"PNG": "image/png", "SVG": "image/svg+xml", "PDF": "application/pdf"}
-    ext_map = {"PNG": "png", "SVG": "svg", "PDF": "pdf"}
-
-    with dl_col1:
-        st.download_button(
-            f"📥 Download as PNG",
-            data=_render_to_bytes("PNG", export_dpi),
-            file_name="forest_plot.png",
-            mime="image/png",
-        )
-    with dl_col2:
-        st.download_button(
-            "📥 Download as SVG",
-            data=_render_to_bytes("SVG", export_dpi),
-            file_name="forest_plot.svg",
-            mime="image/svg+xml",
-        )
-    with dl_col3:
-        st.download_button(
-            "📥 Download as PDF",
-            data=_render_to_bytes("PDF", export_dpi),
-            file_name="forest_plot.pdf",
-            mime="application/pdf",
-        )
+    for col, fmt in zip([dl_col1, dl_col2, dl_col3], ["PNG", "SVG", "PDF"]):
+        with col:
+            key = f"dl_bytes_{fmt}"
+            if key in st.session_state:
+                st.download_button(
+                    f"📥 Download {fmt}",
+                    data=st.session_state[key],
+                    file_name=st.session_state[f"dl_fname_{fmt}"],
+                    mime=st.session_state[f"dl_mime_{fmt}"],
+                    key=f"dl_btn_{fmt}",
+                )
+            else:
+                st.button(f"📥 Download {fmt}", disabled=True, key=f"dl_btn_{fmt}_disabled",
+                          help="Click 'Prepare downloads' above first.")
 
 else:
     st.info("👆 Choose a data input method above and enter your data to generate a forest plot.")
