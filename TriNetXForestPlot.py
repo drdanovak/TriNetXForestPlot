@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt
 
 plt.style.use("seaborn-v0_8-whitegrid")
 
-st.set_page_config(layout="wide")
+# KEY FIX #1: Default sidebar stays open on load
+st.set_page_config(layout="wide", initial_sidebar_state="expanded")
 st.title("🌲 Novak's TriNetX Forest Plot Generator")
 
 REQUIRED_COLS = ["Outcome", "Effect Size", "Lower CI", "Upper CI"]
@@ -79,20 +80,16 @@ def _blank_row_for(df: pd.DataFrame) -> dict:
 
 
 def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
-    """
-    Easier row tools:
-      - Pick row by number (1..N) and see a live preview
-      - Big action buttons (Up/Down/Insert Above/Below/Toggle Header/Delete Selected)
-      - Separate "Delete checked rows" and "Clear delete checks"
-      - Header row checkbox column (🅷 Header) that auto-converts rows into headers
-    """
     if state_key not in st.session_state:
         st.session_state[state_key] = _normalize_table(df_seed)
 
     st.session_state[state_key] = _normalize_table(st.session_state[state_key])
     df_now = st.session_state[state_key]
 
-    st.caption("Tip: Check 🅷 Header to make a row a section header (no need to type '##'). You can still use '##' if you want.")
+    st.caption(
+        "Tip: Check 🅷 Header to make a row a section header (no need to type '##'). "
+        "You can still use '##' if you want."
+    )
 
     edited = st.data_editor(
         df_now,
@@ -131,7 +128,7 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
     df_view[ORDER_COL] = pd.to_numeric(df_view[ORDER_COL], errors="coerce")
     df_view = df_view.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
 
-    # Row tools UI (expanded by default, more ergonomic)
+    # Row tools UI (DEFAULT CLOSED)
     with st.expander("Row tools (move / insert / header / delete)", expanded=False):
         top = st.columns([2.2, 3.8, 1.2, 1.2, 1.4, 1.4, 1.6])
         with top[0]:
@@ -165,7 +162,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
 
         curr_order = float(pd.to_numeric(df_view.loc[sel_idx, ORDER_COL], errors="coerce"))
 
-        # Move Up
         with top[2]:
             if st.button("⬆️ Up", key=f"up_{state_key}", use_container_width=True, disabled=(sel_idx <= 0)):
                 above_order = float(pd.to_numeric(df_view.loc[sel_idx - 1, ORDER_COL], errors="coerce"))
@@ -174,7 +170,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2.loc[sel_idx - 1, ORDER_COL] = curr_order
                 commit(df2)
 
-        # Move Down
         with top[3]:
             if st.button("⬇️ Down", key=f"down_{state_key}", use_container_width=True, disabled=(sel_idx >= len(df_view) - 1)):
                 below_order = float(pd.to_numeric(df_view.loc[sel_idx + 1, ORDER_COL], errors="coerce"))
@@ -183,7 +178,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2.loc[sel_idx + 1, ORDER_COL] = curr_order
                 commit(df2)
 
-        # Insert Above
         with top[4]:
             if st.button("➕ Insert above", key=f"ins_above_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
@@ -192,7 +186,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2 = pd.concat([df2, pd.DataFrame([new_row])], ignore_index=True)
                 commit(df2)
 
-        # Insert Below
         with top[5]:
             if st.button("➕ Insert below", key=f"ins_below_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
@@ -201,7 +194,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2 = pd.concat([df2, pd.DataFrame([new_row])], ignore_index=True)
                 commit(df2)
 
-        # Toggle Header for selected
         with top[6]:
             if st.button("🅷 Toggle header", key=f"toggle_hdr_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
@@ -212,13 +204,11 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 commit(df2)
 
         bottom = st.columns([2.0, 2.0, 3.0, 3.0])
-        # Delete selected row (immediate)
         with bottom[0]:
             if st.button("🗑 Delete selected row", key=f"del_sel_{state_key}", use_container_width=True):
                 df2 = df_view.copy().drop(index=sel_idx).reset_index(drop=True)
                 commit(df2)
 
-        # Delete checked rows
         with bottom[1]:
             if st.button("🗑 Delete checked rows", key=f"del_checked_{state_key}", use_container_width=True):
                 df2 = df_now.copy()
@@ -226,14 +216,12 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2 = df2.loc[~mask].copy().reset_index(drop=True)
                 commit(df2)
 
-        # Clear delete checks
         with bottom[2]:
             if st.button("✅ Clear delete checks", key=f"clear_del_{state_key}", use_container_width=True):
                 df2 = df_now.copy()
                 df2[DELETE_COL] = False
                 commit(df2)
 
-        # Quick add header row below selected (common workflow)
         with bottom[3]:
             if st.button("➕ Add header row below", key=f"add_hdr_below_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
@@ -337,9 +325,7 @@ def _parse_section_effect(lines, section_name: str):
                 uci = uci if uci is not None else uci2
 
             if eff is not None and lci is not None and uci is not None:
-                results.append(
-                    {"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci}
-                )
+                results.append({"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci})
 
     return results
 
@@ -411,28 +397,17 @@ def parse_uploaded_trinetx_file(uploaded_file):
 
 
 def insert_section_headers(df: pd.DataFrame, group_col: str):
-    """
-    Inserts header rows into REQUIRED_COLS schema.
-    Uses HEADER_COL instead of forcing '##' prefixes.
-    """
     if df.empty or group_col not in df.columns:
         return df
 
     out_rows = []
     for g, sub in df.groupby(group_col, sort=False):
         out_rows.append(
-            {
-                "Outcome": str(g),
-                "Effect Size": None,
-                "Lower CI": None,
-                "Upper CI": None,
-                HEADER_COL: True,
-            }
+            {"Outcome": str(g), "Effect Size": None, "Lower CI": None, "Upper CI": None, HEADER_COL: True}
         )
         out_rows.extend(sub[REQUIRED_COLS].to_dict("records"))
 
-    out = pd.DataFrame(out_rows)
-    return out
+    return pd.DataFrame(out_rows)
 
 
 # ----------------------------
@@ -443,6 +418,7 @@ input_mode = st.radio(
     ["✍️ Manual entry", "📄 Import TriNetX tables", "📤 Upload structured file"],
     index=0,
     horizontal=True,
+    key="input_mode",
 )
 
 df = None
@@ -464,6 +440,7 @@ elif input_mode == "📄 Import TriNetX tables":
         "Upload one or more TriNetX export tables (CSV/XLSX/DOCX)",
         type=["csv", "xlsx", "docx"],
         accept_multiple_files=True,
+        key="trinetx_uploads",
     )
 
     if uploaded_files:
@@ -490,13 +467,19 @@ elif input_mode == "📄 Import TriNetX tables":
 
             effect_types = sorted(parsed["Effect Type"].unique().tolist())
             default_keep = [t for t in ["Risk Ratio", "Hazard Ratio"] if t in effect_types] or effect_types
-            keep_types = st.multiselect("Effect types to include:", options=effect_types, default=default_keep)
+            keep_types = st.multiselect(
+                "Effect types to include:",
+                options=effect_types,
+                default=default_keep,
+                key="keep_types",
+            )
 
             plot_base = parsed[parsed["Effect Type"].isin(keep_types)].copy()
 
             append_type_when_needed = st.checkbox(
                 "Append effect type to Outcome label when the same outcome has multiple effect types",
                 value=True,
+                key="append_type",
             )
             if append_type_when_needed and not plot_base.empty:
                 multi = plot_base.groupby("Outcome")["Effect Type"].nunique()
@@ -506,8 +489,14 @@ elif input_mode == "📄 Import TriNetX tables":
                     axis=1,
                 )
 
-            add_headers = st.checkbox("Insert section headers per uploaded table", value=False)
-            header_grouping = st.selectbox("Header grouping field", ["Source", "File"], index=0, disabled=not add_headers)
+            add_headers = st.checkbox("Insert section headers per uploaded table", value=False, key="add_headers")
+            header_grouping = st.selectbox(
+                "Header grouping field",
+                ["Source", "File"],
+                index=0,
+                disabled=not add_headers,
+                key="header_grouping",
+            )
 
             for c in REQUIRED_COLS:
                 if c not in plot_base.columns:
@@ -555,7 +544,7 @@ else:  # Upload structured file
         mime="text/csv",
     )
 
-    uploaded_file = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx"])
+    uploaded_file = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx"], key="structured_upload")
     if uploaded_file:
         try:
             sig = (uploaded_file.name, uploaded_file.size)
@@ -578,63 +567,94 @@ else:  # Upload structured file
 
 
 # ----------------------------
+# KEY FIX #2: Sidebar always renders (disabled until data exists)
+# ----------------------------
+have_data = df is not None
+
+st.sidebar.header("⚙️ Plot Settings")
+
+plot_title = st.sidebar.text_input("Plot Title", value=st.session_state.get("plot_title", "Forest Plot"),
+                                  key="plot_title", disabled=not have_data)
+x_axis_label = st.sidebar.text_input("X-axis Label", value=st.session_state.get("x_axis_label", "Effect Size (RR / OR / HR)"),
+                                     key="x_axis_label", disabled=not have_data)
+
+show_grid = st.sidebar.checkbox("Show Grid", value=st.session_state.get("show_grid", True),
+                               key="show_grid", disabled=not have_data)
+show_values = st.sidebar.checkbox("Show Numerical Annotations", value=st.session_state.get("show_values", False),
+                                 key="show_values", disabled=not have_data)
+use_groups = st.sidebar.checkbox("Also treat rows starting with '##' as section headers",
+                                 value=st.session_state.get("use_groups", True),
+                                 key="use_groups", disabled=not have_data)
+
+with st.sidebar.expander("📏 X-axis range controls", expanded=False):
+    use_custom_xlim = st.checkbox("Use custom X-axis start/end", value=st.session_state.get("use_custom_xlim", False),
+                                  key="use_custom_xlim", disabled=not have_data)
+    x_start = st.number_input("X-axis start", value=float(st.session_state.get("x_start", 0.0)),
+                              step=0.1, key="x_start", disabled=(not have_data) or (not use_custom_xlim))
+    x_end = st.number_input("X-axis end", value=float(st.session_state.get("x_end", 3.0)),
+                            step=0.1, key="x_end", disabled=(not have_data) or (not use_custom_xlim))
+
+with st.sidebar.expander("🧱 Top headroom & layout", expanded=False):
+    top_headroom_rows = st.slider("Top headroom (rows)", 0.0, 6.0,
+                                  float(st.session_state.get("top_headroom_rows", 0.0)),
+                                  step=0.5, key="top_headroom_rows", disabled=not have_data)
+    bottom_padding_rows = st.slider("Bottom padding (rows)", 0.0, 6.0,
+                                    float(st.session_state.get("bottom_padding_rows", 1.0)),
+                                    step=0.5, key="bottom_padding_rows", disabled=not have_data)
+    title_pad_pts = st.slider("Title pad (points)", 0, 40,
+                              int(st.session_state.get("title_pad_pts", 12)),
+                              step=2, key="title_pad_pts", disabled=not have_data)
+
+with st.sidebar.expander("🎨 Advanced Visual Controls", expanded=False):
+    color_scheme = st.selectbox("Color Scheme", ["Color", "Black & White"],
+                                index=0 if st.session_state.get("color_scheme", "Color") == "Color" else 1,
+                                key="color_scheme", disabled=not have_data)
+    point_size = st.slider("Marker Size", 6, 20, int(st.session_state.get("point_size", 10)),
+                           key="point_size", disabled=not have_data)
+    line_width = st.slider("CI Line Width", 1, 4, int(st.session_state.get("line_width", 2)),
+                           key="line_width", disabled=not have_data)
+    font_size = st.slider("Font Size", 10, 20, int(st.session_state.get("font_size", 12)),
+                          key="font_size", disabled=not have_data)
+    label_offset = st.slider("Label Horizontal Offset", 0.01, 0.3, float(st.session_state.get("label_offset", 0.05)),
+                             key="label_offset", disabled=not have_data)
+    use_log = st.checkbox("Use Log Scale for X-axis", value=st.session_state.get("use_log", False),
+                          key="use_log", disabled=not have_data)
+    axis_padding = st.slider("X-axis Padding (%)", 2, 40, int(st.session_state.get("axis_padding", 10)),
+                             key="axis_padding", disabled=not have_data)
+    cap_height = st.slider("Tick Height (for CI ends)", 0.05, 0.5, float(st.session_state.get("cap_height", 0.18)),
+                           step=0.01, key="cap_height", disabled=not have_data)
+
+    if color_scheme == "Color":
+        ci_color = st.color_picker("CI Color", st.session_state.get("ci_color", "#1f77b4"),
+                                   key="ci_color", disabled=not have_data)
+        marker_color = st.color_picker("Point Color", st.session_state.get("marker_color", "#d62728"),
+                                       key="marker_color", disabled=not have_data)
+    else:
+        ci_color = "black"
+        marker_color = "black"
+
+if not have_data:
+    st.sidebar.info("Load or enter data to enable plot controls.")
+
+
+# ----------------------------
 # Plot controls + plot
 # ----------------------------
 if df is not None:
-    # Drop delete column; keep HEADER_COL only for plot logic (not shown on axis)
     plot_df = df.drop(columns=[DELETE_COL], errors="ignore").copy()
 
-    # Respect explicit ordering if present
     if ORDER_COL in plot_df.columns:
         plot_df[ORDER_COL] = pd.to_numeric(plot_df[ORDER_COL], errors="coerce")
         plot_df = plot_df.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
 
-    # Ensure required columns exist
     for c in REQUIRED_COLS:
         if c not in plot_df.columns:
             plot_df[c] = None
     if HEADER_COL not in plot_df.columns:
         plot_df[HEADER_COL] = False
 
-    # Coerce numeric cols
     for c in ["Effect Size", "Lower CI", "Upper CI"]:
         plot_df[c] = pd.to_numeric(plot_df[c], errors="coerce")
-
-    st.sidebar.header("⚙️ Basic Plot Settings")
-    plot_title = st.sidebar.text_input("Plot Title", value="Forest Plot")
-    x_axis_label = st.sidebar.text_input("X-axis Label", value="Effect Size (RR / OR / HR)")
-    show_grid = st.sidebar.checkbox("Show Grid", value=True)
-    show_values = st.sidebar.checkbox("Show Numerical Annotations", value=False)
-    # Keep this option for backward compatibility with older "##" habit
-    use_groups = st.sidebar.checkbox("Also treat rows starting with '##' as section headers", value=True)
-
-    with st.sidebar.expander("📏 X-axis range controls", expanded=False):
-        use_custom_xlim = st.checkbox("Use custom X-axis start/end", value=False)
-        x_start = st.number_input("X-axis start", value=0.0, step=0.1, disabled=not use_custom_xlim)
-        x_end = st.number_input("X-axis end", value=3.0, step=0.1, disabled=not use_custom_xlim)
-
-    with st.sidebar.expander("🧱 Top headroom & layout", expanded=False):
-        # Default is now 0 rows (your request)
-        top_headroom_rows = st.slider("Top headroom (rows)", 0.0, 6.0, 0.0, step=0.5)
-        bottom_padding_rows = st.slider("Bottom padding (rows)", 0.0, 6.0, 1.0, step=0.5)
-        title_pad_pts = st.slider("Title pad (points)", 0, 40, 12, step=2)
-
-    with st.sidebar.expander("🎨 Advanced Visual Controls", expanded=False):
-        color_scheme = st.selectbox("Color Scheme", ["Color", "Black & White"])
-        point_size = st.slider("Marker Size", 6, 20, 10)
-        line_width = st.slider("CI Line Width", 1, 4, 2)
-        font_size = st.slider("Font Size", 10, 20, 12)
-        label_offset = st.slider("Label Horizontal Offset", 0.01, 0.3, 0.05)
-        use_log = st.checkbox("Use Log Scale for X-axis", value=False)
-        axis_padding = st.slider("X-axis Padding (%)", 2, 40, 10)
-        cap_height = st.slider("Tick Height (for CI ends)", 0.05, 0.5, 0.18, step=0.01)
-
-        if color_scheme == "Color":
-            ci_color = st.color_picker("CI Color", "#1f77b4")
-            marker_color = st.color_picker("Point Color", "#d62728")
-        else:
-            ci_color = "black"
-            marker_color = "black"
 
     if st.button("📊 Generate Forest Plot"):
         rows = []
@@ -727,7 +747,6 @@ if df is not None:
         else:
             ax.grid(False)
 
-        # Headroom control (top headroom default = 0 now)
         ax.set_ylim(len(y_labels) - 1 + bottom_padding_rows, -1 - top_headroom_rows)
 
         ax.set_xlabel(x_axis_label, fontsize=font_size)
