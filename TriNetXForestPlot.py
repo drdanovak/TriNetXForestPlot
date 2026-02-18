@@ -132,7 +132,7 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
     df_view = df_view.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
 
     # Row tools UI (expanded by default, more ergonomic)
-    with st.expander("Row tools (move / insert / header / delete)", expanded=True):
+    with st.expander("Row tools (move / insert / header / delete)", expanded=False):
         top = st.columns([2.2, 3.8, 1.2, 1.2, 1.4, 1.4, 1.6])
         with top[0]:
             row_num = st.number_input(
