@@ -54,7 +54,7 @@ def _normalize_table(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
     df[ORDER_COL] = range(1, len(df) + 1)
 
-    # If a row is marked as header, blank out numeric columns (keeps plot logic clean)
+    # If a row is marked as header, blank out numeric columns
     hdr = df[HEADER_COL].fillna(False).astype(bool)
     if hdr.any():
         df.loc[hdr, ["Effect Size", "Lower CI", "Upper CI"]] = None
@@ -78,13 +78,14 @@ def _blank_row_for(df: pd.DataFrame) -> dict:
     return row
 
 
-def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
+def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str, tools_expanded_default: bool = False):
     """
     Easier row tools:
-      - Pick row by number (1..N) and see a live preview
-      - Big action buttons (Up/Down/Insert Above/Below/Toggle Header/Delete Selected)
-      - Separate "Delete checked rows" and "Clear delete checks"
-      - Header row checkbox column (🅷 Header) that auto-converts rows into headers
+      - Pick row by number (1..N) + live preview
+      - Buttons: Up/Down/Insert Above/Below/Toggle Header/Delete Selected
+      - Delete checked rows + Clear delete checks
+      - Header row checkbox column (🅷 Header)
+    Row tools expander defaults to CLOSED for all table types by default.
     """
     if state_key not in st.session_state:
         st.session_state[state_key] = _normalize_table(df_seed)
@@ -119,7 +120,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
         },
     )
 
-    # Persist edits, then normalize (this also blanks numeric cells for header rows)
     st.session_state[state_key] = _normalize_table(edited)
     df_now = st.session_state[state_key]
 
@@ -131,9 +131,10 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
     df_view[ORDER_COL] = pd.to_numeric(df_view[ORDER_COL], errors="coerce")
     df_view = df_view.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
 
-    # Row tools UI (expanded by default, more ergonomic)
-    with st.expander("Row tools (move / insert / header / delete)", expanded=True):
+    # Row tools UI (DEFAULT CLOSED)
+    with st.expander("Row tools (move / insert / header / delete)", expanded=tools_expanded_default):
         top = st.columns([2.2, 3.8, 1.2, 1.2, 1.4, 1.4, 1.6])
+
         with top[0]:
             row_num = st.number_input(
                 "Row #",
@@ -145,7 +146,7 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
             )
             sel_idx = int(row_num) - 1
 
-        # Preview panel
+        # Preview
         with top[1]:
             o = df_view.loc[sel_idx, "Outcome"]
             o = "" if pd.isna(o) else str(o)
@@ -165,7 +166,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
 
         curr_order = float(pd.to_numeric(df_view.loc[sel_idx, ORDER_COL], errors="coerce"))
 
-        # Move Up
         with top[2]:
             if st.button("⬆️ Up", key=f"up_{state_key}", use_container_width=True, disabled=(sel_idx <= 0)):
                 above_order = float(pd.to_numeric(df_view.loc[sel_idx - 1, ORDER_COL], errors="coerce"))
@@ -174,7 +174,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2.loc[sel_idx - 1, ORDER_COL] = curr_order
                 commit(df2)
 
-        # Move Down
         with top[3]:
             if st.button("⬇️ Down", key=f"down_{state_key}", use_container_width=True, disabled=(sel_idx >= len(df_view) - 1)):
                 below_order = float(pd.to_numeric(df_view.loc[sel_idx + 1, ORDER_COL], errors="coerce"))
@@ -183,7 +182,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2.loc[sel_idx + 1, ORDER_COL] = curr_order
                 commit(df2)
 
-        # Insert Above
         with top[4]:
             if st.button("➕ Insert above", key=f"ins_above_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
@@ -192,7 +190,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2 = pd.concat([df2, pd.DataFrame([new_row])], ignore_index=True)
                 commit(df2)
 
-        # Insert Below
         with top[5]:
             if st.button("➕ Insert below", key=f"ins_below_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
@@ -201,7 +198,6 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2 = pd.concat([df2, pd.DataFrame([new_row])], ignore_index=True)
                 commit(df2)
 
-        # Toggle Header for selected
         with top[6]:
             if st.button("🅷 Toggle header", key=f"toggle_hdr_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
@@ -212,13 +208,12 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 commit(df2)
 
         bottom = st.columns([2.0, 2.0, 3.0, 3.0])
-        # Delete selected row (immediate)
+
         with bottom[0]:
             if st.button("🗑 Delete selected row", key=f"del_sel_{state_key}", use_container_width=True):
                 df2 = df_view.copy().drop(index=sel_idx).reset_index(drop=True)
                 commit(df2)
 
-        # Delete checked rows
         with bottom[1]:
             if st.button("🗑 Delete checked rows", key=f"del_checked_{state_key}", use_container_width=True):
                 df2 = df_now.copy()
@@ -226,14 +221,12 @@ def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
                 df2 = df2.loc[~mask].copy().reset_index(drop=True)
                 commit(df2)
 
-        # Clear delete checks
         with bottom[2]:
             if st.button("✅ Clear delete checks", key=f"clear_del_{state_key}", use_container_width=True):
                 df2 = df_now.copy()
                 df2[DELETE_COL] = False
                 commit(df2)
 
-        # Quick add header row below selected (common workflow)
         with bottom[3]:
             if st.button("➕ Add header row below", key=f"add_hdr_below_{state_key}", use_container_width=True):
                 df2 = df_view.copy()
@@ -337,9 +330,7 @@ def _parse_section_effect(lines, section_name: str):
                 uci = uci if uci is not None else uci2
 
             if eff is not None and lci is not None and uci is not None:
-                results.append(
-                    {"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci}
-                )
+                results.append({"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci})
 
     return results
 
@@ -411,10 +402,6 @@ def parse_uploaded_trinetx_file(uploaded_file):
 
 
 def insert_section_headers(df: pd.DataFrame, group_col: str):
-    """
-    Inserts header rows into REQUIRED_COLS schema.
-    Uses HEADER_COL instead of forcing '##' prefixes.
-    """
     if df.empty or group_col not in df.columns:
         return df
 
@@ -431,8 +418,7 @@ def insert_section_headers(df: pd.DataFrame, group_col: str):
         )
         out_rows.extend(sub[REQUIRED_COLS].to_dict("records"))
 
-    out = pd.DataFrame(out_rows)
-    return out
+    return pd.DataFrame(out_rows)
 
 
 # ----------------------------
@@ -451,13 +437,13 @@ if input_mode == "✍️ Manual entry":
     default_data = pd.DataFrame(
         {
             "Outcome": ["Cardiovascular", "Hypertension", "Stroke", "Metabolic", "Diabetes", "Obesity"],
+            HEADER_COL: [True, False, False, True, False, False],
             "Effect Size": [None, 1.5, 1.2, None, 0.85, 1.2],
             "Lower CI": [None, 1.2, 1.0, None, 0.7, 1.0],
             "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
-            HEADER_COL: [True, False, False, True, False, False],
         }
     )
-    df = editable_table_with_row_ops(default_data, "manual_table_df")
+    df = editable_table_with_row_ops(default_data, "manual_table_df", tools_expanded_default=False)
 
 elif input_mode == "📄 Import TriNetX tables":
     uploaded_files = st.file_uploader(
@@ -520,7 +506,7 @@ elif input_mode == "📄 Import TriNetX tables":
             else:
                 df_for_editor = plot_base[REQUIRED_COLS].copy()
 
-            df = editable_table_with_row_ops(df_for_editor, "trinetx_import_table_df")
+            df = editable_table_with_row_ops(df_for_editor, "trinetx_import_table_df", tools_expanded_default=False)
 
             with st.expander("Extracted Data", expanded=False):
                 st.dataframe(parsed, use_container_width=True)
@@ -572,7 +558,7 @@ else:  # Upload structured file
                 st.error(f"Your file must include columns: {REQUIRED_COLS}")
                 df = None
             else:
-                df = editable_table_with_row_ops(df_loaded, "structured_table_df")
+                df = editable_table_with_row_ops(df_loaded, "structured_table_df", tools_expanded_default=False)
         except Exception as e:
             st.error(f"Error reading file: {e}")
 
@@ -581,22 +567,18 @@ else:  # Upload structured file
 # Plot controls + plot
 # ----------------------------
 if df is not None:
-    # Drop delete column; keep HEADER_COL only for plot logic (not shown on axis)
     plot_df = df.drop(columns=[DELETE_COL], errors="ignore").copy()
 
-    # Respect explicit ordering if present
     if ORDER_COL in plot_df.columns:
         plot_df[ORDER_COL] = pd.to_numeric(plot_df[ORDER_COL], errors="coerce")
         plot_df = plot_df.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
 
-    # Ensure required columns exist
     for c in REQUIRED_COLS:
         if c not in plot_df.columns:
             plot_df[c] = None
     if HEADER_COL not in plot_df.columns:
         plot_df[HEADER_COL] = False
 
-    # Coerce numeric cols
     for c in ["Effect Size", "Lower CI", "Upper CI"]:
         plot_df[c] = pd.to_numeric(plot_df[c], errors="coerce")
 
@@ -605,7 +587,6 @@ if df is not None:
     x_axis_label = st.sidebar.text_input("X-axis Label", value="Effect Size (RR / OR / HR)")
     show_grid = st.sidebar.checkbox("Show Grid", value=True)
     show_values = st.sidebar.checkbox("Show Numerical Annotations", value=False)
-    # Keep this option for backward compatibility with older "##" habit
     use_groups = st.sidebar.checkbox("Also treat rows starting with '##' as section headers", value=True)
 
     with st.sidebar.expander("📏 X-axis range controls", expanded=False):
@@ -614,7 +595,6 @@ if df is not None:
         x_end = st.number_input("X-axis end", value=3.0, step=0.1, disabled=not use_custom_xlim)
 
     with st.sidebar.expander("🧱 Top headroom & layout", expanded=False):
-        # Default is now 0 rows (your request)
         top_headroom_rows = st.slider("Top headroom (rows)", 0.0, 6.0, 0.0, step=0.5)
         bottom_padding_rows = st.slider("Bottom padding (rows)", 0.0, 6.0, 1.0, step=0.5)
         title_pad_pts = st.slider("Title pad (points)", 0, 40, 12, step=2)
@@ -667,7 +647,6 @@ if df is not None:
 
         fig, ax = plt.subplots(figsize=(10, max(2.5, len(y_labels) * 0.7)))
 
-        # X limits
         if use_custom_xlim:
             if x_end <= x_start:
                 st.error("Custom X-axis end must be greater than start.")
@@ -695,7 +674,6 @@ if df is not None:
             x_pad = (x_max - x_min) * (axis_padding / 100)
             ax.set_xlim(x_min - x_pad, x_max + x_pad)
 
-        # Plot
         for i, row in enumerate(rows):
             if row is None:
                 continue
@@ -727,7 +705,6 @@ if df is not None:
         else:
             ax.grid(False)
 
-        # Headroom control (top headroom default = 0 now)
         ax.set_ylim(len(y_labels) - 1 + bottom_padding_rows, -1 - top_headroom_rows)
 
         ax.set_xlabel(x_axis_label, fontsize=font_size)
