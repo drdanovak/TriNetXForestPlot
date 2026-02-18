@@ -564,8 +564,6 @@ def build_forest_plot(plot_df: pd.DataFrame, cfg: dict) -> plt.Figure:
         ax.set_xscale("log")
 
     ax.grid(cfg["show_grid"], axis="x", linestyle=":", linewidth=0.6)
-    if not cfg["show_grid"]:
-        ax.grid(False)
 
     # top_headroom pushes the axis ceiling up (positive = more space at top of figure)
     ax.set_ylim(n - 1 + cfg["bottom_padding"], -1 - cfg["top_headroom"])
@@ -764,6 +762,7 @@ st.sidebar.header("⚙️ Plot Settings")
 with st.sidebar.expander("🏷️ Labels", expanded=True):
     plot_title = st.text_input("Plot title", value=DEFAULTS["plot_title"])
     x_axis_label = st.text_input("X-axis label", value=DEFAULTS["x_axis_label"])
+    show_grid = st.checkbox("Show grid", value=True)
     show_values = st.checkbox("Show numerical annotations on plot", value=False)
     use_groups = st.checkbox("Treat '##' prefix as section header", value=True)
 
@@ -828,6 +827,7 @@ cfg = dict(
     x_axis_label=x_axis_label,
     ref_line=ref_line_val if show_ref_line else None,
     ref_line_label=ref_line_label,
+    show_grid=show_grid,
     show_values=show_values,
     use_groups=use_groups,
     use_log=use_log,
