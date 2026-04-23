@@ -346,6 +346,48 @@ def build_plot_table_from_trinetx(parsed_rows, preferred_measure):
     return built
 
 
+def infer_ratio_axis_label(df):
+    if "Effect Type" in df.columns:
+        effect_types = [str(x).strip() for x in df["Effect Type"].dropna().tolist() if str(x).strip()]
+        unique_effect_types = list(dict.fromkeys(effect_types))
+        if len(unique_effect_types) == 1:
+            return unique_effect_types[0]
+        if len(unique_effect_types) > 1:
+            return "Effect Estimate"
+    return st.session_state.get("manual_ratio_label", "Risk Ratio")
+
+
+def compute_ratio_axis_limits(ci_vals, axis_padding, use_log=False):
+    numeric_vals = pd.to_numeric(ci_vals, errors="coerce")
+    numeric_vals = numeric_vals.replace([np.inf, -np.inf], np.nan).dropna()
+    numeric_vals = numeric_vals[numeric_vals > 0]
+
+    if numeric_vals.empty:
+        return 0.5, 1.5
+
+    raw_min = float(min(numeric_vals.min(), 1.0))
+    raw_max = float(max(numeric_vals.max(), 1.0))
+
+    if use_log:
+        lower_factor = 1.0 / raw_min if raw_min > 0 else raw_max
+        upper_factor = raw_max
+        factor = max(lower_factor, upper_factor, 1.25)
+        factor *= (1 + axis_padding / 100)
+        return max(1 / factor, 1e-6), factor
+
+    dist_left = max(1.0 - raw_min, 0.0)
+    dist_right = max(raw_max - 1.0, 0.0)
+    half_span = max(dist_left, dist_right)
+    if half_span == 0:
+        half_span = 0.25
+    padded_half_span = half_span * (1 + axis_padding / 100)
+    auto_min = max(0.0, 1.0 - padded_half_span)
+    auto_max = 1.0 + padded_half_span
+    if auto_min == auto_max:
+        auto_max = auto_min + 1.0
+    return auto_min, auto_max
+
+
 # =========================
 # App UI
 # =========================
@@ -369,6 +411,7 @@ if input_mode == "📤 Upload file(s)":
             index=0,
             help="For MOA files, the app will prefer this estimate when available. KM tables contribute Hazard Ratios automatically.",
         )
+        st.session_state["manual_ratio_label"] = preferred_measure
 
         parsed_trinetx_rows, parsed_standard_tables, parsing_notes = detect_and_load_uploaded_files(uploaded_files)
 
@@ -487,6 +530,17 @@ if df is not None:
         index=1,
     )
 
+    if x_measure == "Risk, Odds, or Hazard Ratio" and "Effect Type" not in df.columns:
+        default_ratio_label_index = ["Risk Ratio", "Odds Ratio", "Hazard Ratio"].index(
+            st.session_state.get("manual_ratio_label", "Risk Ratio")
+        ) if st.session_state.get("manual_ratio_label", "Risk Ratio") in ["Risk Ratio", "Odds Ratio", "Hazard Ratio"] else 0
+        st.session_state["manual_ratio_label"] = st.sidebar.selectbox(
+            "Label ratio axis as",
+            ["Risk Ratio", "Odds Ratio", "Hazard Ratio"],
+            index=default_ratio_label_index,
+            help="Use this when the uploaded table does not include an explicit effect type column.",
+        )
+
     plot_title = st.sidebar.text_input("Plot Title", value="Forest Plot")
     show_grid = st.sidebar.checkbox("Show Grid", value=True)
     show_values = st.sidebar.checkbox("Show Numerical Annotations", value=False)
@@ -527,10 +581,14 @@ if df is not None:
         ci_vals = pd.concat([ci_l.dropna(), ci_u.dropna(), pd.to_numeric(df[plot_column], errors="coerce").dropna()])
         ref_line = 1
 
-    x_axis_label = plot_column
+    if x_measure == "Risk, Odds, or Hazard Ratio":
+        x_axis_label = infer_ratio_axis_label(df)
+        auto_x_min, auto_x_max = compute_ratio_axis_limits(ci_vals, axis_padding, use_log=use_log)
+    else:
+        x_axis_label = plot_column
+        auto_x_min = ci_vals.min() if not ci_vals.empty else None
+        auto_x_max = ci_vals.max() if not ci_vals.empty else None
 
-    auto_x_min = ci_vals.min() if not ci_vals.empty else None
-    auto_x_max = ci_vals.max() if not ci_vals.empty else None
     auto_x_span = (auto_x_max - auto_x_min) if auto_x_min is not None and auto_x_max is not None else None
     default_x_pad = (auto_x_span * (axis_padding / 100)) if auto_x_span is not None and auto_x_span != 0 else 0.1
 
@@ -580,8 +638,6 @@ if df is not None:
             st.error("No plottable effect estimates were found.")
         else:
             fig, ax = plt.subplots(figsize=(10, max(2.5, len(y_labels) * 0.7)))
-            x_min, x_max = ci_vals.min(), ci_vals.max()
-            x_pad = (x_max - x_min) * (axis_padding / 100) if x_max != x_min else 0.1
 
             if manual_x_axis:
                 if manual_x_min >= manual_x_max:
@@ -589,7 +645,13 @@ if df is not None:
                     st.stop()
                 ax.set_xlim(manual_x_min, manual_x_max)
             else:
-                ax.set_xlim(x_min - x_pad, x_max + x_pad)
+                if x_measure == "Risk, Odds, or Hazard Ratio":
+                    auto_plot_x_min, auto_plot_x_max = compute_ratio_axis_limits(ci_vals, axis_padding, use_log=use_log)
+                    ax.set_xlim(auto_plot_x_min, auto_plot_x_max)
+                else:
+                    x_min, x_max = ci_vals.min(), ci_vals.max()
+                    x_pad = (x_max - x_min) * (axis_padding / 100) if x_max != x_min else 0.1
+                    ax.set_xlim(x_min - x_pad, x_max + x_pad)
 
             for i, row in enumerate(rows):
                 if row is None:
