@@ -1,660 +1,414 @@
-import io
 import csv
+import io
 import re
 from pathlib import Path
 
-import streamlit as st
-import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 plt.style.use("seaborn-v0_8-whitegrid")
-
-# KEY FIX #1: Default sidebar stays open on load
-st.set_page_config(layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide")
 st.title("🌲 Novak's TriNetX Forest Plot Generator")
 
-REQUIRED_COLS = ["Outcome", "Effect Size", "Lower CI", "Upper CI"]
-DELETE_COL = "🗑 Delete"
-ORDER_COL = "↕ Order"
-HEADER_COL = "🅷 Header"
+required_cols = [
+    "Outcome",
+    "Risk, Odds, or Hazard Ratio",
+    "Effect Size (Cohen's d, approx.)",
+    "Lower CI",
+    "Upper CI",
+]
 
 
-# ----------------------------
-# Table helpers: order + insert + move + delete + header (IMPROVED UX)
-# ----------------------------
-def _normalize_table(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # Ensure required cols exist
-    for c in REQUIRED_COLS:
-        if c not in df.columns:
-            df[c] = None
-
-    # Ensure control columns exist
-    if DELETE_COL not in df.columns:
-        df.insert(0, DELETE_COL, False)
-    if HEADER_COL not in df.columns:
-        df.insert(0, HEADER_COL, False)
-    if ORDER_COL not in df.columns:
-        df.insert(0, ORDER_COL, list(range(1, len(df) + 1)))
-
-    # Normalize types
-    df[DELETE_COL] = df[DELETE_COL].fillna(False).astype(bool)
-    df[HEADER_COL] = df[HEADER_COL].fillna(False).astype(bool)
-    df[ORDER_COL] = pd.to_numeric(df[ORDER_COL], errors="coerce")
-
-    # Fill missing ORDER values at the end
-    if df[ORDER_COL].isna().any():
-        max_order = df[ORDER_COL].max(skipna=True)
-        max_order = 0 if pd.isna(max_order) else float(max_order)
-        na_idx = df.index[df[ORDER_COL].isna()].tolist()
-        for k, idx in enumerate(na_idx, start=1):
-            df.loc[idx, ORDER_COL] = max_order + k
-
-    # Sort by ORDER (stable), then renumber sequentially
-    df = df.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
-    df[ORDER_COL] = range(1, len(df) + 1)
-
-    # If a row is marked as header, blank out numeric columns (keeps plot logic clean)
-    hdr = df[HEADER_COL].fillna(False).astype(bool)
-    if hdr.any():
-        df.loc[hdr, ["Effect Size", "Lower CI", "Upper CI"]] = None
-
-    return df
-
-
-def _blank_row_for(df: pd.DataFrame) -> dict:
-    row = {}
-    for c in df.columns:
-        if c == DELETE_COL:
-            row[c] = False
-        elif c == HEADER_COL:
-            row[c] = False
-        elif c == ORDER_COL:
-            row[c] = None
-        elif c in ["Effect Size", "Lower CI", "Upper CI"]:
-            row[c] = None
-        else:
-            row[c] = ""
-    return row
-
-
-def editable_table_with_row_ops(df_seed: pd.DataFrame, state_key: str):
-    if state_key not in st.session_state:
-        st.session_state[state_key] = _normalize_table(df_seed)
-
-    st.session_state[state_key] = _normalize_table(st.session_state[state_key])
-    df_now = st.session_state[state_key]
-
-    st.caption(
-        "Tip: Check 🅷 Header to make a row a section header (no need to type '##'). "
-        "You can still use '##' if you want."
-    )
-
-    edited = st.data_editor(
-        df_now,
-        num_rows="dynamic",
-        use_container_width=True,
-        key=f"editor_{state_key}",
-        column_config={
-            ORDER_COL: st.column_config.NumberColumn(
-                ORDER_COL,
-                help="Row order. You can type numbers here or use the row tools below.",
-                step=1,
-            ),
-            HEADER_COL: st.column_config.CheckboxColumn(
-                HEADER_COL,
-                help="Treat this row as a header/section title (effect/CI ignored).",
-            ),
-            DELETE_COL: st.column_config.CheckboxColumn(
-                DELETE_COL,
-                help="Mark rows for deletion (then click 'Delete checked rows').",
-            ),
-            "Effect Size": st.column_config.NumberColumn("Effect Size", step=0.01, format="%.4f"),
-            "Lower CI": st.column_config.NumberColumn("Lower CI", step=0.01, format="%.4f"),
-            "Upper CI": st.column_config.NumberColumn("Upper CI", step=0.01, format="%.4f"),
-        },
-    )
-
-    # Persist edits, then normalize (this also blanks numeric cells for header rows)
-    st.session_state[state_key] = _normalize_table(edited)
-    df_now = st.session_state[state_key]
-
-    if len(df_now) == 0:
-        return df_now
-
-    # Work in view-sorted space (by ORDER_COL)
-    df_view = df_now.copy()
-    df_view[ORDER_COL] = pd.to_numeric(df_view[ORDER_COL], errors="coerce")
-    df_view = df_view.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
-
-    # Row tools UI (DEFAULT CLOSED)
-    with st.expander("Row tools (move / insert / header / delete)", expanded=False):
-        top = st.columns([2.2, 3.8, 1.2, 1.2, 1.4, 1.4, 1.6])
-        with top[0]:
-            row_num = st.number_input(
-                "Row #",
-                min_value=1,
-                max_value=len(df_view),
-                value=1,
-                step=1,
-                key=f"rownum_{state_key}",
-            )
-            sel_idx = int(row_num) - 1
-
-        # Preview panel
-        with top[1]:
-            o = df_view.loc[sel_idx, "Outcome"]
-            o = "" if pd.isna(o) else str(o)
-            is_hdr = bool(df_view.loc[sel_idx, HEADER_COL])
-            es = df_view.loc[sel_idx, "Effect Size"]
-            lci = df_view.loc[sel_idx, "Lower CI"]
-            uci = df_view.loc[sel_idx, "Upper CI"]
-            if is_hdr:
-                st.write(f"Selected: **HEADER** → {o}")
-            else:
-                st.write(f"Selected: {o}")
-                st.write(f"Effect/CI: {es}  |  {lci}–{uci}")
-
-        def commit(df_commit: pd.DataFrame):
-            st.session_state[state_key] = _normalize_table(df_commit)
-            st.rerun()
-
-        curr_order = float(pd.to_numeric(df_view.loc[sel_idx, ORDER_COL], errors="coerce"))
-
-        with top[2]:
-            if st.button("⬆️ Up", key=f"up_{state_key}", use_container_width=True, disabled=(sel_idx <= 0)):
-                above_order = float(pd.to_numeric(df_view.loc[sel_idx - 1, ORDER_COL], errors="coerce"))
-                df2 = df_view.copy()
-                df2.loc[sel_idx, ORDER_COL] = above_order
-                df2.loc[sel_idx - 1, ORDER_COL] = curr_order
-                commit(df2)
-
-        with top[3]:
-            if st.button("⬇️ Down", key=f"down_{state_key}", use_container_width=True, disabled=(sel_idx >= len(df_view) - 1)):
-                below_order = float(pd.to_numeric(df_view.loc[sel_idx + 1, ORDER_COL], errors="coerce"))
-                df2 = df_view.copy()
-                df2.loc[sel_idx, ORDER_COL] = below_order
-                df2.loc[sel_idx + 1, ORDER_COL] = curr_order
-                commit(df2)
-
-        with top[4]:
-            if st.button("➕ Insert above", key=f"ins_above_{state_key}", use_container_width=True):
-                df2 = df_view.copy()
-                new_row = _blank_row_for(df2)
-                new_row[ORDER_COL] = curr_order - 0.5
-                df2 = pd.concat([df2, pd.DataFrame([new_row])], ignore_index=True)
-                commit(df2)
-
-        with top[5]:
-            if st.button("➕ Insert below", key=f"ins_below_{state_key}", use_container_width=True):
-                df2 = df_view.copy()
-                new_row = _blank_row_for(df2)
-                new_row[ORDER_COL] = curr_order + 0.5
-                df2 = pd.concat([df2, pd.DataFrame([new_row])], ignore_index=True)
-                commit(df2)
-
-        with top[6]:
-            if st.button("🅷 Toggle header", key=f"toggle_hdr_{state_key}", use_container_width=True):
-                df2 = df_view.copy()
-                new_val = not bool(df2.loc[sel_idx, HEADER_COL])
-                df2.loc[sel_idx, HEADER_COL] = new_val
-                if new_val:
-                    df2.loc[sel_idx, ["Effect Size", "Lower CI", "Upper CI"]] = None
-                commit(df2)
-
-        bottom = st.columns([2.0, 2.0, 3.0, 3.0])
-        with bottom[0]:
-            if st.button("🗑 Delete selected row", key=f"del_sel_{state_key}", use_container_width=True):
-                df2 = df_view.copy().drop(index=sel_idx).reset_index(drop=True)
-                commit(df2)
-
-        with bottom[1]:
-            if st.button("🗑 Delete checked rows", key=f"del_checked_{state_key}", use_container_width=True):
-                df2 = df_now.copy()
-                mask = df2[DELETE_COL].fillna(False).astype(bool)
-                df2 = df2.loc[~mask].copy().reset_index(drop=True)
-                commit(df2)
-
-        with bottom[2]:
-            if st.button("✅ Clear delete checks", key=f"clear_del_{state_key}", use_container_width=True):
-                df2 = df_now.copy()
-                df2[DELETE_COL] = False
-                commit(df2)
-
-        with bottom[3]:
-            if st.button("➕ Add header row below", key=f"add_hdr_below_{state_key}", use_container_width=True):
-                df2 = df_view.copy()
-                new_row = _blank_row_for(df2)
-                new_row[HEADER_COL] = True
-                new_row[ORDER_COL] = curr_order + 0.5
-                df2 = pd.concat([df2, pd.DataFrame([new_row])], ignore_index=True)
-                commit(df2)
-
-    return st.session_state[state_key]
-
-
-# ----------------------------
-# TriNetX parsing utils
-# ----------------------------
-def _clean_line(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).strip()
-    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
-        s = s[1:-1]
-    return s.strip()
-
-
-def _to_float(x):
+def compute_cohens_d(rr):
     try:
-        if x is None:
-            return None
-        x = str(x).strip()
-        if x == "":
-            return None
-        return float(x)
+        if pd.isnull(rr):
+            return np.nan
+        val = float(rr)
+        if val <= 0:
+            return np.nan
+        return np.log(val) * (np.sqrt(3) / np.pi)
+    except Exception:
+        return np.nan
+
+
+def clean_cell(value):
+    if value is None:
+        return ""
+    text = str(value).replace("\ufeff", "").strip()
+    text = text.strip('"').strip()
+    return text
+
+
+def parse_float(value):
+    text = clean_cell(value).replace(",", "")
+    if text in {"", " ", "nan", "None"}:
+        return None
+    try:
+        return float(text)
     except Exception:
         return None
 
 
-def _extract_ci_from_string(s: str):
-    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", str(s or ""))
-    if len(nums) >= 3:
-        return (_to_float(nums[0]), _to_float(nums[1]), _to_float(nums[2]))
-    return (None, None, None)
+def next_nonblank_row(rows, start_idx):
+    for idx in range(start_idx, len(rows)):
+        if any(clean_cell(cell) for cell in rows[idx]):
+            return idx
+    return None
 
 
-def _parse_section_effect(lines, section_name: str):
-    results = []
-    n = len(lines)
-
-    for i, line in enumerate(lines):
-        if _clean_line(line).lower() == section_name.lower():
-            j = i + 1
-            while j < n and _clean_line(lines[j]) == "":
-                j += 1
-            if j >= n:
-                continue
-
-            header_line = lines[j]
-            try:
-                header = next(csv.reader([header_line]))
-            except Exception:
-                header = [header_line]
-            header = [h.strip() for h in header if h is not None]
-
-            k = j + 1
-            while k < n and _clean_line(lines[k]) == "":
-                k += 1
-            if k >= n:
-                continue
-
-            value_line = lines[k]
-            try:
-                vals = next(csv.reader([value_line]))
-            except Exception:
-                vals = [value_line]
-            vals = [v.strip() for v in vals]
-
-            lower_idx = None
-            upper_idx = None
-            for idx, h in enumerate(header):
-                hl = h.lower()
-                if ("ci" in hl and "lower" in hl) or ("95" in hl and "lower" in hl):
-                    lower_idx = idx
-                if ("ci" in hl and "upper" in hl) or ("95" in hl and "upper" in hl):
-                    upper_idx = idx
-
-            eff_idx = None
-            for idx, h in enumerate(header):
-                if section_name.lower().replace(" ", "") in h.lower().replace(" ", ""):
-                    eff_idx = idx
-                    break
-            if eff_idx is None:
-                eff_idx = 0
-
-            eff = _to_float(vals[eff_idx]) if eff_idx < len(vals) else None
-            lci = _to_float(vals[lower_idx]) if (lower_idx is not None and lower_idx < len(vals)) else None
-            uci = _to_float(vals[upper_idx]) if (upper_idx is not None and upper_idx < len(vals)) else None
-
-            if eff is None or lci is None or uci is None:
-                eff2, lci2, uci2 = _extract_ci_from_string(" ".join(vals))
-                eff = eff if eff is not None else eff2
-                lci = lci if lci is not None else lci2
-                uci = uci if uci is not None else uci2
-
-            if eff is not None and lci is not None and uci is not None:
-                results.append({"Effect Type": section_name, "Effect Size": eff, "Lower CI": lci, "Upper CI": uci})
-
-    return results
+def extract_section_triplet(rows, section_name):
+    for i, row in enumerate(rows):
+        first = clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
+        if first == section_name:
+            header_idx = next_nonblank_row(rows, i + 1)
+            data_idx = next_nonblank_row(rows, (header_idx + 1) if header_idx is not None else i + 1)
+            if data_idx is None:
+                return None
+            numeric_values = [parse_float(cell) for cell in rows[data_idx]]
+            numeric_values = [x for x in numeric_values if x is not None]
+            if len(numeric_values) >= 3:
+                return {
+                    "estimate": numeric_values[0],
+                    "lower": numeric_values[1],
+                    "upper": numeric_values[2],
+                }
+    return None
 
 
-def parse_trinetx_export_text(text: str, filename: str):
-    lines = (text or "").splitlines()
-    if lines:
-        lines[0] = lines[0].lstrip("\ufeff")
-
-    title = None
-    for l in lines:
-        cl = _clean_line(l)
-        if cl:
-            title = cl
-            break
-
-    base_outcome = Path(filename).stem
-
-    extracted = []
-    for section in ["Risk Ratio", "Hazard Ratio", "Odds Ratio"]:
-        extracted.extend(_parse_section_effect(lines, section))
-
-    if not extracted:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(extracted)
-    df.insert(0, "Outcome", base_outcome)
-    df["Source"] = title or filename
-    df["File"] = filename
-    return df
+def extract_title_from_rows(rows):
+    for row in rows[:8]:
+        first = clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
+        if first and first != "Generated by TriNetX":
+            return first
+    return ""
 
 
-def parse_uploaded_trinetx_file(uploaded_file):
-    name = uploaded_file.name
-    ext = name.split(".")[-1].lower()
-
-    if ext == "csv":
-        raw = uploaded_file.getvalue().decode("utf-8-sig", errors="replace")
-        return parse_trinetx_export_text(raw, name)
-
-    if ext == "xlsx":
-        xls = pd.ExcelFile(uploaded_file)
-        flat_lines = []
-        for sheet in xls.sheet_names:
-            sheet_df = pd.read_excel(xls, sheet_name=sheet, header=None)
-            for _, r in sheet_df.iterrows():
-                vals = [str(v).strip() for v in r.tolist() if pd.notnull(v) and str(v).strip() != ""]
-                if vals:
-                    flat_lines.append(",".join(vals))
-        return parse_trinetx_export_text("\n".join(flat_lines), name)
-
-    if ext == "docx":
-        from docx import Document
-
-        doc = Document(io.BytesIO(uploaded_file.getvalue()))
-        lines = []
-        for p in doc.paragraphs:
-            t = p.text.strip()
-            if t:
-                lines.append(t)
-        for table in doc.tables:
-            for row in table.rows:
-                cells = [c.text.strip() for c in row.cells]
-                if any(cells):
-                    lines.append(",".join(cells))
-        return parse_trinetx_export_text("\n".join(lines), name)
-
-    return pd.DataFrame()
+def clean_title(title):
+    title = clean_cell(title)
+    title = re.sub(r"\s*Measures of Association Table\s*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title).strip(" -_")
+    return title
 
 
-def insert_section_headers(df: pd.DataFrame, group_col: str):
-    if df.empty or group_col not in df.columns:
-        return df
+def clean_filename(name):
+    stem = Path(name).stem
+    stem = re.sub(r"(?i)_result_[a-z0-9]+_moa_table$", "", stem)
+    stem = re.sub(r"(?i)_moa_table$", "", stem)
+    stem = re.sub(r"(?i)_table$", "", stem)
+    stem = stem.replace("_", " ").replace("-", " ")
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return stem
 
+
+def looks_generic(label):
+    text = (label or "").strip().lower()
+    return bool(re.match(r"^outcome\s*\d+(\s+result.*)?$", text))
+
+
+def choose_outcome_label(title, filename):
+    cleaned_title = clean_title(title)
+    cleaned_filename = clean_filename(filename)
+    if cleaned_title and not looks_generic(cleaned_title):
+        return cleaned_title
+    if cleaned_filename:
+        return cleaned_filename
+    return cleaned_title or "Outcome"
+
+
+def parse_trinetx_csv_text(file_bytes):
+    text = file_bytes.decode("utf-8-sig", errors="ignore")
+    rows = list(csv.reader(io.StringIO(text)))
+    return rows, text
+
+
+def parse_trinetx_excel_rows(file_bytes):
+    raw = pd.read_excel(io.BytesIO(file_bytes), header=None, dtype=str)
+    rows = raw.fillna("").values.tolist()
+    joined = "\n".join([",".join([clean_cell(cell) for cell in row]) for row in rows])
+    return rows, joined
+
+
+def parse_trinetx_moa_rows(rows, filename):
+    title = extract_title_from_rows(rows)
+    risk_ratio = extract_section_triplet(rows, "Risk Ratio")
+    odds_ratio = extract_section_triplet(rows, "Odds Ratio")
+    hazard_ratio = extract_section_triplet(rows, "Hazard Ratio")
+
+    if not any([risk_ratio, odds_ratio, hazard_ratio]):
+        return None
+
+    return {
+        "Outcome": choose_outcome_label(title, filename),
+        "Source File": filename,
+        "Risk Ratio": risk_ratio["estimate"] if risk_ratio else np.nan,
+        "RR Lower CI": risk_ratio["lower"] if risk_ratio else np.nan,
+        "RR Upper CI": risk_ratio["upper"] if risk_ratio else np.nan,
+        "Odds Ratio": odds_ratio["estimate"] if odds_ratio else np.nan,
+        "OR Lower CI": odds_ratio["lower"] if odds_ratio else np.nan,
+        "OR Upper CI": odds_ratio["upper"] if odds_ratio else np.nan,
+        "Hazard Ratio": hazard_ratio["estimate"] if hazard_ratio else np.nan,
+        "HR Lower CI": hazard_ratio["lower"] if hazard_ratio else np.nan,
+        "HR Upper CI": hazard_ratio["upper"] if hazard_ratio else np.nan,
+    }
+
+
+def standardize_existing_forest_table(df):
+    working = df.copy()
+    for col in required_cols:
+        if col not in working.columns:
+            working[col] = np.nan
+
+    numeric_cols = [
+        "Risk, Odds, or Hazard Ratio",
+        "Lower CI",
+        "Upper CI",
+        "Effect Size (Cohen's d, approx.)",
+    ]
+    for col in numeric_cols:
+        working[col] = pd.to_numeric(working[col], errors="coerce")
+
+    if working["Effect Size (Cohen's d, approx.)"].isna().all():
+        working["Effect Size (Cohen's d, approx.)"] = working["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
+
+    return working[required_cols]
+
+
+def detect_and_load_uploaded_files(uploaded_files):
+    parsed_trinetx_rows = []
+    parsed_standard_tables = []
+    parsing_notes = []
+
+    for uploaded_file in uploaded_files:
+        file_bytes = uploaded_file.getvalue()
+        filename = uploaded_file.name
+        suffix = Path(filename).suffix.lower()
+
+        try:
+            if suffix == ".csv":
+                rows, raw_text = parse_trinetx_csv_text(file_bytes)
+                if "Generated by TriNetX" in raw_text and any(x in raw_text for x in ["Risk Ratio", "Odds Ratio", "Hazard Ratio"]):
+                    parsed = parse_trinetx_moa_rows(rows, filename)
+                    if parsed is not None:
+                        parsed_trinetx_rows.append(parsed)
+                        continue
+                standard_df = pd.read_csv(io.BytesIO(file_bytes))
+                parsed_standard_tables.append(standardize_existing_forest_table(standard_df))
+            elif suffix in {".xlsx", ".xls"}:
+                try:
+                    rows, raw_text = parse_trinetx_excel_rows(file_bytes)
+                    if "Generated by TriNetX" in raw_text and any(x in raw_text for x in ["Risk Ratio", "Odds Ratio", "Hazard Ratio"]):
+                        parsed = parse_trinetx_moa_rows(rows, filename)
+                        if parsed is not None:
+                            parsed_trinetx_rows.append(parsed)
+                            continue
+                except Exception:
+                    pass
+                standard_df = pd.read_excel(io.BytesIO(file_bytes))
+                parsed_standard_tables.append(standardize_existing_forest_table(standard_df))
+            else:
+                parsing_notes.append(f"Skipped unsupported file type: {filename}")
+        except Exception as e:
+            parsing_notes.append(f"Could not parse {filename}: {e}")
+
+    return parsed_trinetx_rows, parsed_standard_tables, parsing_notes
+
+
+def build_plot_table_from_trinetx(parsed_rows, preferred_measure):
     out_rows = []
-    for g, sub in df.groupby(group_col, sort=False):
-        out_rows.append(
-            {"Outcome": str(g), "Effect Size": None, "Lower CI": None, "Upper CI": None, HEADER_COL: True}
-        )
-        out_rows.extend(sub[REQUIRED_COLS].to_dict("records"))
+
+    for row in parsed_rows:
+        measure_priority = [preferred_measure]
+        for candidate in ["Risk Ratio", "Odds Ratio", "Hazard Ratio"]:
+            if candidate not in measure_priority:
+                measure_priority.append(candidate)
+
+        chosen_measure = None
+        estimate = lower = upper = np.nan
+
+        for candidate in measure_priority:
+            if candidate == "Risk Ratio" and pd.notnull(row.get("Risk Ratio", np.nan)):
+                chosen_measure = candidate
+                estimate = row["Risk Ratio"]
+                lower = row["RR Lower CI"]
+                upper = row["RR Upper CI"]
+                break
+            if candidate == "Odds Ratio" and pd.notnull(row.get("Odds Ratio", np.nan)):
+                chosen_measure = candidate
+                estimate = row["Odds Ratio"]
+                lower = row["OR Lower CI"]
+                upper = row["OR Upper CI"]
+                break
+            if candidate == "Hazard Ratio" and pd.notnull(row.get("Hazard Ratio", np.nan)):
+                chosen_measure = candidate
+                estimate = row["Hazard Ratio"]
+                lower = row["HR Lower CI"]
+                upper = row["HR Upper CI"]
+                break
+
+        out_rows.append({
+            "Outcome": row["Outcome"],
+            "Risk, Odds, or Hazard Ratio": estimate,
+            "Effect Size (Cohen's d, approx.)": compute_cohens_d(estimate),
+            "Lower CI": lower,
+            "Upper CI": upper,
+            "Effect Type": chosen_measure,
+            "Source File": row["Source File"],
+        })
 
     return pd.DataFrame(out_rows)
 
 
-# ----------------------------
-# Input mode UI (re-ordered)
-# ----------------------------
 input_mode = st.radio(
-    "Select data input method:",
-    ["✍️ Manual entry", "📄 Import TriNetX tables", "📤 Upload structured file"],
-    index=0,
-    horizontal=True,
-    key="input_mode",
+    "Select data input method:", ["📤 Upload file(s)", "✍️ Manual entry"], index=0, horizontal=True
 )
 
 df = None
 
-if input_mode == "✍️ Manual entry":
-    default_data = pd.DataFrame(
-        {
-            "Outcome": ["Cardiovascular", "Hypertension", "Stroke", "Metabolic", "Diabetes", "Obesity"],
-            "Effect Size": [None, 1.5, 1.2, None, 0.85, 1.2],
-            "Lower CI": [None, 1.2, 1.0, None, 0.7, 1.0],
-            "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
-            HEADER_COL: [True, False, False, True, False, False],
-        }
-    )
-    df = editable_table_with_row_ops(default_data, "manual_table_df")
-
-elif input_mode == "📄 Import TriNetX tables":
+if input_mode == "📤 Upload file(s)":
     uploaded_files = st.file_uploader(
-        "Upload one or more TriNetX export tables (CSV/XLSX/DOCX)",
-        type=["csv", "xlsx", "docx"],
+        "Upload one normalized forest-plot table or multiple raw TriNetX outcome tables",
+        type=["csv", "xlsx", "xls"],
         accept_multiple_files=True,
-        key="trinetx_uploads",
     )
 
     if uploaded_files:
-        parsed_frames = []
-        failures = []
+        preferred_measure = st.sidebar.selectbox(
+            "Preferred TriNetX estimate to plot",
+            ["Risk Ratio", "Odds Ratio", "Hazard Ratio"],
+            index=0,
+            help="If a raw TriNetX file contains multiple estimates, the app will use this measure when available.",
+        )
 
-        for f in uploaded_files:
-            try:
-                p = parse_uploaded_trinetx_file(f)
-                if not p.empty:
-                    parsed_frames.append(p)
-                else:
-                    failures.append((f.name, "No Risk Ratio / Hazard Ratio / Odds Ratio section found."))
-            except Exception as e:
-                failures.append((f.name, str(e)))
+        parsed_trinetx_rows, parsed_standard_tables, parsing_notes = detect_and_load_uploaded_files(uploaded_files)
 
-        if failures:
-            with st.expander("Parsing warnings", expanded=False):
-                for fn, msg in failures:
-                    st.write(f"- {fn}: {msg}")
+        assembled_tables = []
+        if parsed_trinetx_rows:
+            trinetx_df = build_plot_table_from_trinetx(parsed_trinetx_rows, preferred_measure)
+            assembled_tables.append(trinetx_df[required_cols + ["Effect Type", "Source File"]])
+        if parsed_standard_tables:
+            for table in parsed_standard_tables:
+                table = table.copy()
+                table["Effect Type"] = np.nan
+                table["Source File"] = np.nan
+                assembled_tables.append(table[required_cols + ["Effect Type", "Source File"]])
 
-        if parsed_frames:
-            parsed = pd.concat(parsed_frames, ignore_index=True)
-
-            effect_types = sorted(parsed["Effect Type"].unique().tolist())
-            default_keep = [t for t in ["Risk Ratio", "Hazard Ratio"] if t in effect_types] or effect_types
-            keep_types = st.multiselect(
-                "Effect types to include:",
-                options=effect_types,
-                default=default_keep,
-                key="keep_types",
+        if assembled_tables:
+            combined_df = pd.concat(assembled_tables, ignore_index=True)
+            st.subheader("Parsed data preview")
+            st.caption("You can edit outcome labels, reorder rows, or insert section headers using ## before a label.")
+            editable_cols = required_cols + ["Effect Type", "Source File"]
+            edited_df = st.data_editor(
+                combined_df[editable_cols],
+                num_rows="dynamic",
+                use_container_width=True,
+                key="uploaded_table_editor",
+                column_config={
+                    "Effect Size (Cohen's d, approx.)": st.column_config.NumberColumn(
+                        "Effect Size (Cohen's d, approx.)",
+                        disabled=True,
+                        help="Auto-calculated as ln(RR/OR/HR) × sqrt(3)/π",
+                    ),
+                    "Effect Type": st.column_config.TextColumn(disabled=True),
+                    "Source File": st.column_config.TextColumn(disabled=True),
+                },
             )
-
-            plot_base = parsed[parsed["Effect Type"].isin(keep_types)].copy()
-
-            append_type_when_needed = st.checkbox(
-                "Append effect type to Outcome label when the same outcome has multiple effect types",
-                value=True,
-                key="append_type",
-            )
-            if append_type_when_needed and not plot_base.empty:
-                multi = plot_base.groupby("Outcome")["Effect Type"].nunique()
-                multi_outcomes = set(multi[multi > 1].index)
-                plot_base["Outcome"] = plot_base.apply(
-                    lambda r: f"{r['Outcome']} ({r['Effect Type']})" if r["Outcome"] in multi_outcomes else r["Outcome"],
-                    axis=1,
-                )
-
-            add_headers = st.checkbox("Insert section headers per uploaded table", value=False, key="add_headers")
-            header_grouping = st.selectbox(
-                "Header grouping field",
-                ["Source", "File"],
-                index=0,
-                disabled=not add_headers,
-                key="header_grouping",
-            )
-
-            for c in REQUIRED_COLS:
-                if c not in plot_base.columns:
-                    plot_base[c] = None
-            for c in ["Effect Size", "Lower CI", "Upper CI"]:
-                plot_base[c] = pd.to_numeric(plot_base[c], errors="coerce")
-
-            if add_headers:
-                df_for_editor = insert_section_headers(plot_base, group_col=header_grouping)
-            else:
-                df_for_editor = plot_base[REQUIRED_COLS].copy()
-
-            df = editable_table_with_row_ops(df_for_editor, "trinetx_import_table_df")
-
-            with st.expander("Extracted Data", expanded=False):
-                st.dataframe(parsed, use_container_width=True)
-
-            st.download_button(
-                "📥 Download parsed rows as CSV",
-                data=plot_base.to_csv(index=False).encode("utf-8"),
-                file_name="parsed_trinetx_effects.csv",
-                mime="text/csv",
-            )
+            edited_df["Effect Size (Cohen's d, approx.)"] = edited_df["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
+            df = edited_df
         else:
-            st.info("No parsable TriNetX effect sections were found in the uploaded files.")
-    else:
-        st.info("Upload one or more TriNetX export tables to parse effect sizes and confidence intervals.")
+            st.error("No usable forest-plot data could be parsed from the uploaded files.")
 
-else:  # Upload structured file
-    st.subheader("Upload a structured file")
+        if parsing_notes:
+            with st.expander("Parsing notes"):
+                for note in parsing_notes:
+                    st.write(f"- {note}")
+else:
+    default_data = pd.DataFrame({
+        "Outcome": ["## Cardiovascular", "Hypertension", "Stroke", "## Metabolic", "Diabetes", "Obesity"],
+        "Risk, Odds, or Hazard Ratio": [None, 1.5, 1.2, None, 0.85, 1.2],
+        "Lower CI": [None, 1.2, 1.0, None, 0.7, 1.0],
+        "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
+    })
+    default_data["Effect Size (Cohen's d, approx.)"] = default_data["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
+    default_data = default_data[[
+        "Outcome",
+        "Risk, Odds, or Hazard Ratio",
+        "Effect Size (Cohen's d, approx.)",
+        "Lower CI",
+        "Upper CI",
+    ]]
+    if "manual_table" not in st.session_state:
+        st.session_state.manual_table = default_data.copy()
 
-    template_df = pd.DataFrame(
-        {
-            "Outcome": ["Cardiovascular", "Hypertension", "Stroke"],
-            HEADER_COL: [True, False, False],
-            "Effect Size": [None, 1.50, 1.20],
-            "Lower CI": [None, 1.20, 1.00],
-            "Upper CI": [None, 1.80, 1.50],
-        }
+    _, col2 = st.columns([2, 1])
+    with col2:
+        if st.button("🧹 Clear Table"):
+            st.session_state.manual_table = pd.DataFrame({col: [None] * 6 for col in required_cols})
+
+    manual_df = st.session_state.manual_table.copy()
+    manual_df["Effect Size (Cohen's d, approx.)"] = manual_df["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
+    manual_df = manual_df[required_cols]
+    st.session_state.manual_table = st.data_editor(
+        manual_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="manual_input_table",
+        column_config={
+            "Effect Size (Cohen's d, approx.)": st.column_config.NumberColumn(
+                "Effect Size (Cohen's d, approx.)",
+                disabled=True,
+                help="Auto-calculated as ln(RR/OR/HR) × sqrt(3)/π",
+            )
+        },
     )
-    st.download_button(
-        "📥 Download structured CSV template",
-        data=template_df.to_csv(index=False).encode("utf-8"),
-        file_name="forest_plot_template.csv",
-        mime="text/csv",
-    )
+    df = st.session_state.manual_table
 
-    uploaded_file = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx"], key="structured_upload")
-    if uploaded_file:
-        try:
-            sig = (uploaded_file.name, uploaded_file.size)
-            if st.session_state.get("structured_file_sig") != sig:
-                st.session_state["structured_file_sig"] = sig
-                st.session_state.pop("structured_table_df", None)
-
-            if uploaded_file.name.endswith(".csv"):
-                df_loaded = pd.read_csv(uploaded_file)
-            else:
-                df_loaded = pd.read_excel(uploaded_file)
-
-            if not all(col in df_loaded.columns for col in REQUIRED_COLS):
-                st.error(f"Your file must include columns: {REQUIRED_COLS}")
-                df = None
-            else:
-                df = editable_table_with_row_ops(df_loaded, "structured_table_df")
-        except Exception as e:
-            st.error(f"Error reading file: {e}")
-
-
-# ----------------------------
-# KEY FIX #2: Sidebar always renders (disabled until data exists)
-# ----------------------------
-have_data = df is not None
-
-st.sidebar.header("⚙️ Plot Settings")
-
-plot_title = st.sidebar.text_input("Plot Title", value=st.session_state.get("plot_title", "Forest Plot"),
-                                  key="plot_title", disabled=not have_data)
-x_axis_label = st.sidebar.text_input("X-axis Label", value=st.session_state.get("x_axis_label", "Effect Size (RR / OR / HR)"),
-                                     key="x_axis_label", disabled=not have_data)
-
-show_grid = st.sidebar.checkbox("Show Grid", value=st.session_state.get("show_grid", True),
-                               key="show_grid", disabled=not have_data)
-show_values = st.sidebar.checkbox("Show Numerical Annotations", value=st.session_state.get("show_values", False),
-                                 key="show_values", disabled=not have_data)
-use_groups = st.sidebar.checkbox("Also treat rows starting with '##' as section headers",
-                                 value=st.session_state.get("use_groups", True),
-                                 key="use_groups", disabled=not have_data)
-
-with st.sidebar.expander("📏 X-axis range controls", expanded=False):
-    use_custom_xlim = st.checkbox("Use custom X-axis start/end", value=st.session_state.get("use_custom_xlim", False),
-                                  key="use_custom_xlim", disabled=not have_data)
-    x_start = st.number_input("X-axis start", value=float(st.session_state.get("x_start", 0.0)),
-                              step=0.1, key="x_start", disabled=(not have_data) or (not use_custom_xlim))
-    x_end = st.number_input("X-axis end", value=float(st.session_state.get("x_end", 3.0)),
-                            step=0.1, key="x_end", disabled=(not have_data) or (not use_custom_xlim))
-
-with st.sidebar.expander("🧱 Top headroom & layout", expanded=False):
-    top_headroom_rows = st.slider("Top headroom (rows)", 0.0, 6.0,
-                                  float(st.session_state.get("top_headroom_rows", 0.0)),
-                                  step=0.5, key="top_headroom_rows", disabled=not have_data)
-    bottom_padding_rows = st.slider("Bottom padding (rows)", 0.0, 6.0,
-                                    float(st.session_state.get("bottom_padding_rows", 1.0)),
-                                    step=0.5, key="bottom_padding_rows", disabled=not have_data)
-    title_pad_pts = st.slider("Title pad (points)", 0, 40,
-                              int(st.session_state.get("title_pad_pts", 12)),
-                              step=2, key="title_pad_pts", disabled=not have_data)
-
-with st.sidebar.expander("🎨 Advanced Visual Controls", expanded=False):
-    color_scheme = st.selectbox("Color Scheme", ["Color", "Black & White"],
-                                index=0 if st.session_state.get("color_scheme", "Color") == "Color" else 1,
-                                key="color_scheme", disabled=not have_data)
-    point_size = st.slider("Marker Size", 6, 20, int(st.session_state.get("point_size", 10)),
-                           key="point_size", disabled=not have_data)
-    line_width = st.slider("CI Line Width", 1, 4, int(st.session_state.get("line_width", 2)),
-                           key="line_width", disabled=not have_data)
-    font_size = st.slider("Font Size", 10, 20, int(st.session_state.get("font_size", 12)),
-                          key="font_size", disabled=not have_data)
-    label_offset = st.slider("Label Horizontal Offset", 0.01, 0.3, float(st.session_state.get("label_offset", 0.05)),
-                             key="label_offset", disabled=not have_data)
-    use_log = st.checkbox("Use Log Scale for X-axis", value=st.session_state.get("use_log", False),
-                          key="use_log", disabled=not have_data)
-    axis_padding = st.slider("X-axis Padding (%)", 2, 40, int(st.session_state.get("axis_padding", 10)),
-                             key="axis_padding", disabled=not have_data)
-    cap_height = st.slider("Tick Height (for CI ends)", 0.05, 0.5, float(st.session_state.get("cap_height", 0.18)),
-                           step=0.01, key="cap_height", disabled=not have_data)
-
-    if color_scheme == "Color":
-        ci_color = st.color_picker("CI Color", st.session_state.get("ci_color", "#1f77b4"),
-                                   key="ci_color", disabled=not have_data)
-        marker_color = st.color_picker("Point Color", st.session_state.get("marker_color", "#d62728"),
-                                       key="marker_color", disabled=not have_data)
-    else:
-        ci_color = "black"
-        marker_color = "black"
-
-if not have_data:
-    st.sidebar.info("Load or enter data to enable plot controls.")
-
-
-# ----------------------------
-# Plot controls + plot
-# ----------------------------
 if df is not None:
-    plot_df = df.drop(columns=[DELETE_COL], errors="ignore").copy()
+    st.sidebar.header("⚙️ Basic Plot Settings")
 
-    if ORDER_COL in plot_df.columns:
-        plot_df[ORDER_COL] = pd.to_numeric(plot_df[ORDER_COL], errors="coerce")
-        plot_df = plot_df.sort_values(ORDER_COL, kind="mergesort").reset_index(drop=True)
+    x_measure = st.sidebar.radio(
+        "Plot on X-axis",
+        ("Effect Size (Cohen's d, approx.)", "Risk, Odds, or Hazard Ratio"),
+        index=1,
+    )
 
-    for c in REQUIRED_COLS:
-        if c not in plot_df.columns:
-            plot_df[c] = None
-    if HEADER_COL not in plot_df.columns:
-        plot_df[HEADER_COL] = False
+    plot_title = st.sidebar.text_input("Plot Title", value="Forest Plot")
+    show_grid = st.sidebar.checkbox("Show Grid", value=True)
+    show_values = st.sidebar.checkbox("Show Numerical Annotations", value=False)
+    use_groups = st.sidebar.checkbox("Treat rows starting with '##' as section headers", value=True)
 
-    for c in ["Effect Size", "Lower CI", "Upper CI"]:
-        plot_df[c] = pd.to_numeric(plot_df[c], errors="coerce")
+    with st.sidebar.expander("🎨 Advanced Visual Controls", expanded=False):
+        color_scheme = st.selectbox("Color Scheme", ["Color", "Black & White"])
+        point_size = st.slider("Marker Size", 6, 20, 10)
+        line_width = st.slider("CI Line Width", 1, 4, 2)
+        font_size = st.slider("Font Size", 10, 20, 12)
+        label_offset = st.slider("Label Horizontal Offset", 0.01, 0.3, 0.05)
+        use_log = st.checkbox("Use Log Scale for X-axis", value=False)
+        axis_padding = st.slider("X-axis Padding (%)", 2, 40, 10)
+        y_axis_padding = st.slider("Y-axis Padding (Rows)", 0.0, 5.0, 1.0, step=0.5)
+        cap_height = st.slider("Tick Height (for CI ends)", 0.05, 0.5, 0.18, step=0.01)
+        if color_scheme == "Color":
+            ci_color = st.color_picker("CI Color", "#1f77b4")
+            marker_color = st.color_picker("Point Color", "#d62728")
+        else:
+            ci_color = "black"
+            marker_color = "black"
+
+    if x_measure == "Effect Size (Cohen's d, approx.)":
+        plot_column = "Effect Size (Cohen's d, approx.)"
+        ci_l = df["Lower CI"].apply(compute_cohens_d)
+        ci_u = df["Upper CI"].apply(compute_cohens_d)
+        ci_vals = pd.concat([ci_l.dropna(), ci_u.dropna(), df[plot_column].dropna()])
+        ref_line = 0
+    else:
+        plot_column = "Risk, Odds, or Hazard Ratio"
+        ci_l = pd.to_numeric(df["Lower CI"], errors="coerce")
+        ci_u = pd.to_numeric(df["Upper CI"], errors="coerce")
+        ci_vals = pd.concat([ci_l.dropna(), ci_u.dropna(), pd.to_numeric(df[plot_column], errors="coerce").dropna()])
+        ref_line = 1
+
+    x_axis_label = plot_column
 
     if st.button("📊 Generate Forest Plot"):
         rows = []
@@ -663,106 +417,86 @@ if df is not None:
         indent = "\u00A0" * 4
         group_mode = False
 
-        for _, row in plot_df.iterrows():
-            outcome_val = row.get("Outcome", "")
-            outcome_val = "" if pd.isna(outcome_val) else str(outcome_val)
-
-            is_header = bool(row.get(HEADER_COL, False))
-            if use_groups and outcome_val.startswith("##"):
-                is_header = True
-
-            if is_header:
-                header_txt = outcome_val
-                if header_txt.startswith("##"):
-                    header_txt = header_txt[2:].lstrip("#").strip()
-                y_labels.append(header_txt.strip())
+        for _, row in df.iterrows():
+            if use_groups and isinstance(row["Outcome"], str) and row["Outcome"].startswith("##"):
+                header = row["Outcome"][3:].strip()
+                y_labels.append(header)
                 text_styles.append("bold")
                 rows.append(None)
                 group_mode = True
             else:
-                display_name = f"{indent}{outcome_val}" if group_mode else outcome_val
+                display_name = f"{indent}{row['Outcome']}" if group_mode else row["Outcome"]
                 y_labels.append(display_name)
                 text_styles.append("normal")
                 rows.append(row)
 
-        fig, ax = plt.subplots(figsize=(10, max(2.5, len(y_labels) * 0.7)))
-
-        # X limits
-        if use_custom_xlim:
-            if x_end <= x_start:
-                st.error("Custom X-axis end must be greater than start.")
-                st.stop()
-            if use_log and (x_start <= 0 or x_end <= 0):
-                st.error("Log scale requires positive X-axis limits.")
-                st.stop()
-            ax.set_xlim(x_start, x_end)
+        if ci_vals.empty:
+            st.error("No plottable effect estimates were found.")
         else:
-            ci_series = pd.concat([plot_df["Lower CI"].dropna(), plot_df["Upper CI"].dropna()], ignore_index=True)
-            if ci_series.empty:
-                st.error("No valid CI values found. Please check your table.")
-                st.stop()
-
-            if use_log:
-                ci_series = ci_series[ci_series > 0]
-                if ci_series.empty:
-                    st.error("Log scale requires positive effect sizes and CI bounds.")
-                    st.stop()
-
-            x_min, x_max = ci_series.min(), ci_series.max()
-            if x_min == x_max:
-                x_min = x_min * 0.9
-                x_max = x_max * 1.1
-            x_pad = (x_max - x_min) * (axis_padding / 100)
+            fig, ax = plt.subplots(figsize=(10, max(2.5, len(y_labels) * 0.7)))
+            x_min, x_max = ci_vals.min(), ci_vals.max()
+            x_pad = (x_max - x_min) * (axis_padding / 100) if x_max != x_min else 0.1
             ax.set_xlim(x_min - x_pad, x_max + x_pad)
 
-        # Plot
-        for i, row in enumerate(rows):
-            if row is None:
-                continue
-            effect = row["Effect Size"]
-            lci = row["Lower CI"]
-            uci = row["Upper CI"]
-            if pd.notnull(effect) and pd.notnull(lci) and pd.notnull(uci):
-                ax.hlines(i, xmin=lci, xmax=uci, color=ci_color, linewidth=line_width, capstyle="round")
-                ax.vlines([lci, uci], i - cap_height, i + cap_height, color=ci_color, linewidth=line_width)
-                ax.plot(effect, i, "o", color=marker_color, markersize=point_size)
-                if show_values:
-                    label = f"{effect:.2f} [{lci:.2f}, {uci:.2f}]"
-                    ax.text(uci + label_offset, i, label, va="center", fontsize=max(8, font_size - 2))
+            for i, row in enumerate(rows):
+                if row is None:
+                    continue
 
-        ax.axvline(x=1, color="gray", linestyle="--", linewidth=1)
+                if x_measure == "Effect Size (Cohen's d, approx.)":
+                    effect = row.get("Effect Size (Cohen's d, approx.)", np.nan)
+                    lci = compute_cohens_d(row.get("Lower CI", np.nan))
+                    uci = compute_cohens_d(row.get("Upper CI", np.nan))
+                else:
+                    effect = pd.to_numeric(pd.Series([row.get("Risk, Odds, or Hazard Ratio", np.nan)]), errors="coerce").iloc[0]
+                    lci = pd.to_numeric(pd.Series([row.get("Lower CI", np.nan)]), errors="coerce").iloc[0]
+                    uci = pd.to_numeric(pd.Series([row.get("Upper CI", np.nan)]), errors="coerce").iloc[0]
 
-        ax.set_yticks(range(len(y_labels)))
-        tick_labels = ax.set_yticklabels(y_labels)
-        for tick_label, style in zip(tick_labels, text_styles):
-            if style == "bold":
-                tick_label.set_fontweight("bold")
-            tick_label.set_fontsize(font_size)
+                if pd.notnull(lci) and pd.notnull(uci):
+                    ax.hlines(i, xmin=lci, xmax=uci, color=ci_color, linewidth=line_width, capstyle="round")
+                    ax.vlines(
+                        [lci, uci],
+                        [i - cap_height, i - cap_height],
+                        [i + cap_height, i + cap_height],
+                        color=ci_color,
+                        linewidth=line_width,
+                    )
 
-        if use_log:
-            ax.set_xscale("log")
+                if pd.notnull(effect):
+                    ax.plot(effect, i, "o", color=marker_color, markersize=point_size, zorder=3)
+                    if show_values and pd.notnull(lci) and pd.notnull(uci):
+                        label = f"{effect:.2f} [{lci:.2f}, {uci:.2f}]"
+                        ax.text(uci + label_offset, i, label, va="center", fontsize=font_size - 2)
 
-        if show_grid:
-            ax.grid(True, axis="x", linestyle=":", linewidth=0.6)
-        else:
-            ax.grid(False)
+            ax.axvline(x=ref_line, color="gray", linestyle="--", linewidth=1)
+            ax.set_yticks(range(len(y_labels)))
+            for tick_label, style in zip(ax.set_yticklabels(y_labels), text_styles):
+                if style == "bold":
+                    tick_label.set_fontweight("bold")
+                tick_label.set_fontsize(font_size)
 
-        ax.set_ylim(len(y_labels) - 1 + bottom_padding_rows, -1 - top_headroom_rows)
+            if use_log:
+                try:
+                    ax.set_xscale("log")
+                except Exception:
+                    st.warning("Log scale is only valid for positive numbers.")
+            if show_grid:
+                ax.grid(True, axis="x", linestyle=":", linewidth=0.6)
+            else:
+                ax.grid(False)
 
-        ax.set_xlabel(x_axis_label, fontsize=font_size)
-        ax.set_title(plot_title, fontsize=font_size + 2, weight="bold", pad=title_pad_pts)
+            ax.set_ylim(len(y_labels) - 1 + y_axis_padding, -1 - y_axis_padding)
+            ax.set_xlabel(x_axis_label, fontsize=font_size)
+            ax.set_title(plot_title, fontsize=font_size + 2, weight="bold")
+            fig.tight_layout()
+            st.pyplot(fig)
 
-        fig.tight_layout()
-
-        st.pyplot(fig)
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=300)
-        st.download_button(
-            "📥 Download Plot as PNG",
-            data=buf.getvalue(),
-            file_name="forest_plot.png",
-            mime="image/png",
-        )
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+            st.download_button(
+                "📥 Download Plot as PNG",
+                data=buf.getvalue(),
+                file_name="forest_plot.png",
+                mime="image/png",
+            )
 else:
-    st.info("Please upload a file or enter data manually to generate a plot.")
+    st.info("Please upload file(s) or enter data manually to generate a plot.")
