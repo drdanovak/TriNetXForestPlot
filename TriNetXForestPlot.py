@@ -21,6 +21,9 @@ required_cols = [
 ]
 
 
+# =========================
+# Core utilities
+# =========================
 def compute_cohens_d(rr):
     try:
         if pd.isnull(rr):
@@ -58,6 +61,9 @@ def next_nonblank_row(rows, start_idx):
     return None
 
 
+# =========================
+# TriNetX parsing helpers
+# =========================
 def extract_section_triplet(rows, section_name):
     for i, row in enumerate(rows):
         first = clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
@@ -77,6 +83,24 @@ def extract_section_triplet(rows, section_name):
     return None
 
 
+def extract_section_value_map(rows, section_name):
+    for i, row in enumerate(rows):
+        first = clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
+        if first == section_name:
+            header_idx = next_nonblank_row(rows, i + 1)
+            data_idx = next_nonblank_row(rows, (header_idx + 1) if header_idx is not None else i + 1)
+            if header_idx is None or data_idx is None:
+                return None
+            headers = [clean_cell(x) for x in rows[header_idx]]
+            values = [clean_cell(x) for x in rows[data_idx]]
+            out = {}
+            for h, v in zip(headers, values):
+                if h:
+                    out[h] = v
+            return out
+    return None
+
+
 def extract_title_from_rows(rows):
     for row in rows[:8]:
         first = clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
@@ -85,9 +109,24 @@ def extract_title_from_rows(rows):
     return ""
 
 
+def detect_trinetx_table_type(title, raw_text):
+    title_clean = clean_cell(title)
+    raw_text = raw_text or ""
+    if "Kaplan-Meier Table" in title_clean or "Kaplan-Meier Table" in raw_text:
+        return "Kaplan-Meier"
+    if "Measures of Association Table" in title_clean or "Measures of Association Table" in raw_text:
+        return "Measures of Association"
+    if "Hazard Ratio" in raw_text and "Log-Rank Test" in raw_text:
+        return "Kaplan-Meier"
+    if any(x in raw_text for x in ["Risk Ratio", "Odds Ratio"]):
+        return "Measures of Association"
+    return "TriNetX"
+
+
 def clean_title(title):
     title = clean_cell(title)
     title = re.sub(r"\s*Measures of Association Table\s*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*Kaplan[- ]Meier Table\s*$", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\s+", " ", title).strip(" -_")
     return title
 
@@ -95,7 +134,10 @@ def clean_title(title):
 def clean_filename(name):
     stem = Path(name).stem
     stem = re.sub(r"(?i)_result_[a-z0-9]+_moa_table$", "", stem)
+    stem = re.sub(r"(?i)_result_[a-z0-9]+_km_table$", "", stem)
     stem = re.sub(r"(?i)_moa_table$", "", stem)
+    stem = re.sub(r"(?i)_km_table$", "", stem)
+    stem = re.sub(r"(?i)_kaplan[-_ ]meier_table$", "", stem)
     stem = re.sub(r"(?i)_table$", "", stem)
     stem = stem.replace("_", " ").replace("-", " ")
     stem = re.sub(r"\s+", " ", stem).strip()
@@ -130,8 +172,10 @@ def parse_trinetx_excel_rows(file_bytes):
     return rows, joined
 
 
-def parse_trinetx_moa_rows(rows, filename):
+def parse_trinetx_effect_rows(rows, filename, raw_text):
     title = extract_title_from_rows(rows)
+    table_type = detect_trinetx_table_type(title, raw_text)
+
     risk_ratio = extract_section_triplet(rows, "Risk Ratio")
     odds_ratio = extract_section_triplet(rows, "Odds Ratio")
     hazard_ratio = extract_section_triplet(rows, "Hazard Ratio")
@@ -139,9 +183,14 @@ def parse_trinetx_moa_rows(rows, filename):
     if not any([risk_ratio, odds_ratio, hazard_ratio]):
         return None
 
+    log_rank = extract_section_value_map(rows, "Log-Rank Test") if table_type == "Kaplan-Meier" else None
+    proportionality = extract_section_value_map(rows, "Proportionality") if table_type == "Kaplan-Meier" else None
+
     return {
         "Outcome": choose_outcome_label(title, filename),
+        "Original Title": clean_title(title),
         "Source File": filename,
+        "TriNetX Table Type": table_type,
         "Risk Ratio": risk_ratio["estimate"] if risk_ratio else np.nan,
         "RR Lower CI": risk_ratio["lower"] if risk_ratio else np.nan,
         "RR Upper CI": risk_ratio["upper"] if risk_ratio else np.nan,
@@ -151,9 +200,14 @@ def parse_trinetx_moa_rows(rows, filename):
         "Hazard Ratio": hazard_ratio["estimate"] if hazard_ratio else np.nan,
         "HR Lower CI": hazard_ratio["lower"] if hazard_ratio else np.nan,
         "HR Upper CI": hazard_ratio["upper"] if hazard_ratio else np.nan,
+        "Log-Rank p": parse_float(log_rank.get("p")) if log_rank else np.nan,
+        "PH Assumption p": parse_float(proportionality.get("p")) if proportionality else np.nan,
     }
 
 
+# =========================
+# Standard table handling
+# =========================
 def standardize_existing_forest_table(df):
     working = df.copy()
     for col in required_cols:
@@ -175,6 +229,17 @@ def standardize_existing_forest_table(df):
     return working[required_cols]
 
 
+# =========================
+# Upload detection
+# =========================
+def looks_like_trinetx_text(raw_text):
+    if not raw_text:
+        return False
+    return "Generated by TriNetX" in raw_text and any(
+        x in raw_text for x in ["Risk Ratio", "Odds Ratio", "Hazard Ratio", "Kaplan-Meier Table", "Measures of Association Table"]
+    )
+
+
 def detect_and_load_uploaded_files(uploaded_files):
     parsed_trinetx_rows = []
     parsed_standard_tables = []
@@ -188,18 +253,19 @@ def detect_and_load_uploaded_files(uploaded_files):
         try:
             if suffix == ".csv":
                 rows, raw_text = parse_trinetx_csv_text(file_bytes)
-                if "Generated by TriNetX" in raw_text and any(x in raw_text for x in ["Risk Ratio", "Odds Ratio", "Hazard Ratio"]):
-                    parsed = parse_trinetx_moa_rows(rows, filename)
+                if looks_like_trinetx_text(raw_text):
+                    parsed = parse_trinetx_effect_rows(rows, filename, raw_text)
                     if parsed is not None:
                         parsed_trinetx_rows.append(parsed)
                         continue
                 standard_df = pd.read_csv(io.BytesIO(file_bytes))
                 parsed_standard_tables.append(standardize_existing_forest_table(standard_df))
+
             elif suffix in {".xlsx", ".xls"}:
                 try:
                     rows, raw_text = parse_trinetx_excel_rows(file_bytes)
-                    if "Generated by TriNetX" in raw_text and any(x in raw_text for x in ["Risk Ratio", "Odds Ratio", "Hazard Ratio"]):
-                        parsed = parse_trinetx_moa_rows(rows, filename)
+                    if looks_like_trinetx_text(raw_text):
+                        parsed = parse_trinetx_effect_rows(rows, filename, raw_text)
                         if parsed is not None:
                             parsed_trinetx_rows.append(parsed)
                             continue
@@ -207,6 +273,7 @@ def detect_and_load_uploaded_files(uploaded_files):
                     pass
                 standard_df = pd.read_excel(io.BytesIO(file_bytes))
                 parsed_standard_tables.append(standardize_existing_forest_table(standard_df))
+
             else:
                 parsing_notes.append(f"Skipped unsupported file type: {filename}")
         except Exception as e:
@@ -215,38 +282,51 @@ def detect_and_load_uploaded_files(uploaded_files):
     return parsed_trinetx_rows, parsed_standard_tables, parsing_notes
 
 
+# =========================
+# Forest plot table assembly
+# =========================
+def choose_effect_for_row(row, preferred_measure):
+    measure_priority = [preferred_measure]
+    for candidate in ["Risk Ratio", "Odds Ratio", "Hazard Ratio"]:
+        if candidate not in measure_priority:
+            measure_priority.append(candidate)
+
+    for candidate in measure_priority:
+        if candidate == "Risk Ratio" and pd.notnull(row.get("Risk Ratio", np.nan)):
+            return candidate, row["Risk Ratio"], row["RR Lower CI"], row["RR Upper CI"]
+        if candidate == "Odds Ratio" and pd.notnull(row.get("Odds Ratio", np.nan)):
+            return candidate, row["Odds Ratio"], row["OR Lower CI"], row["OR Upper CI"]
+        if candidate == "Hazard Ratio" and pd.notnull(row.get("Hazard Ratio", np.nan)):
+            return candidate, row["Hazard Ratio"], row["HR Lower CI"], row["HR Upper CI"]
+
+    return None, np.nan, np.nan, np.nan
+
+
+def deduplicate_outcome_labels(df):
+    df = df.copy()
+    counts = df["Outcome"].value_counts(dropna=False)
+    duplicate_labels = set(counts[counts > 1].index.tolist())
+
+    def relabel(row):
+        label = row["Outcome"]
+        if label in duplicate_labels:
+            effect_type = row.get("Effect Type")
+            table_type = row.get("TriNetX Table Type")
+            if pd.notnull(effect_type) and pd.notnull(table_type):
+                return f"{label} — {effect_type} ({table_type})"
+            if pd.notnull(effect_type):
+                return f"{label} — {effect_type}"
+        return label
+
+    df["Outcome"] = df.apply(relabel, axis=1)
+    return df
+
+
 def build_plot_table_from_trinetx(parsed_rows, preferred_measure):
     out_rows = []
 
     for row in parsed_rows:
-        measure_priority = [preferred_measure]
-        for candidate in ["Risk Ratio", "Odds Ratio", "Hazard Ratio"]:
-            if candidate not in measure_priority:
-                measure_priority.append(candidate)
-
-        chosen_measure = None
-        estimate = lower = upper = np.nan
-
-        for candidate in measure_priority:
-            if candidate == "Risk Ratio" and pd.notnull(row.get("Risk Ratio", np.nan)):
-                chosen_measure = candidate
-                estimate = row["Risk Ratio"]
-                lower = row["RR Lower CI"]
-                upper = row["RR Upper CI"]
-                break
-            if candidate == "Odds Ratio" and pd.notnull(row.get("Odds Ratio", np.nan)):
-                chosen_measure = candidate
-                estimate = row["Odds Ratio"]
-                lower = row["OR Lower CI"]
-                upper = row["OR Upper CI"]
-                break
-            if candidate == "Hazard Ratio" and pd.notnull(row.get("Hazard Ratio", np.nan)):
-                chosen_measure = candidate
-                estimate = row["Hazard Ratio"]
-                lower = row["HR Lower CI"]
-                upper = row["HR Upper CI"]
-                break
-
+        chosen_measure, estimate, lower, upper = choose_effect_for_row(row, preferred_measure)
         out_rows.append({
             "Outcome": row["Outcome"],
             "Risk, Odds, or Hazard Ratio": estimate,
@@ -254,12 +334,21 @@ def build_plot_table_from_trinetx(parsed_rows, preferred_measure):
             "Lower CI": lower,
             "Upper CI": upper,
             "Effect Type": chosen_measure,
+            "TriNetX Table Type": row["TriNetX Table Type"],
+            "Log-Rank p": row.get("Log-Rank p", np.nan),
+            "PH Assumption p": row.get("PH Assumption p", np.nan),
             "Source File": row["Source File"],
         })
 
-    return pd.DataFrame(out_rows)
+    built = pd.DataFrame(out_rows)
+    if not built.empty:
+        built = deduplicate_outcome_labels(built)
+    return built
 
 
+# =========================
+# App UI
+# =========================
 input_mode = st.radio(
     "Select data input method:", ["📤 Upload file(s)", "✍️ Manual entry"], index=0, horizontal=True
 )
@@ -268,7 +357,7 @@ df = None
 
 if input_mode == "📤 Upload file(s)":
     uploaded_files = st.file_uploader(
-        "Upload one normalized forest-plot table or multiple raw TriNetX outcome tables",
+        "Upload one normalized forest-plot table or multiple raw TriNetX MOA / Kaplan–Meier summary tables",
         type=["csv", "xlsx", "xls"],
         accept_multiple_files=True,
     )
@@ -278,7 +367,7 @@ if input_mode == "📤 Upload file(s)":
             "Preferred TriNetX estimate to plot",
             ["Risk Ratio", "Odds Ratio", "Hazard Ratio"],
             index=0,
-            help="If a raw TriNetX file contains multiple estimates, the app will use this measure when available.",
+            help="For MOA files, the app will prefer this estimate when available. KM tables contribute Hazard Ratios automatically.",
         )
 
         parsed_trinetx_rows, parsed_standard_tables, parsing_notes = detect_and_load_uploaded_files(uploaded_files)
@@ -286,19 +375,29 @@ if input_mode == "📤 Upload file(s)":
         assembled_tables = []
         if parsed_trinetx_rows:
             trinetx_df = build_plot_table_from_trinetx(parsed_trinetx_rows, preferred_measure)
-            assembled_tables.append(trinetx_df[required_cols + ["Effect Type", "Source File"]])
+            assembled_tables.append(
+                trinetx_df[required_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
+            )
         if parsed_standard_tables:
             for table in parsed_standard_tables:
                 table = table.copy()
                 table["Effect Type"] = np.nan
+                table["TriNetX Table Type"] = np.nan
+                table["Log-Rank p"] = np.nan
+                table["PH Assumption p"] = np.nan
                 table["Source File"] = np.nan
-                assembled_tables.append(table[required_cols + ["Effect Type", "Source File"]])
+                assembled_tables.append(
+                    table[required_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
+                )
 
         if assembled_tables:
             combined_df = pd.concat(assembled_tables, ignore_index=True)
             st.subheader("Parsed data preview")
-            st.caption("You can edit outcome labels, reorder rows, or insert section headers using ## before a label.")
-            editable_cols = required_cols + ["Effect Type", "Source File"]
+            st.caption(
+                "You can edit outcome labels, reorder rows, or insert section headers using ## before a label. "
+                "KM uploads populate hazard ratios and preserve log-rank / proportionality p-values as metadata."
+            )
+            editable_cols = required_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]
             edited_df = st.data_editor(
                 combined_df[editable_cols],
                 num_rows="dynamic",
@@ -311,11 +410,27 @@ if input_mode == "📤 Upload file(s)":
                         help="Auto-calculated as ln(RR/OR/HR) × sqrt(3)/π",
                     ),
                     "Effect Type": st.column_config.TextColumn(disabled=True),
+                    "TriNetX Table Type": st.column_config.TextColumn(disabled=True),
+                    "Log-Rank p": st.column_config.NumberColumn(disabled=True, format="%.4g"),
+                    "PH Assumption p": st.column_config.NumberColumn(disabled=True, format="%.4g"),
                     "Source File": st.column_config.TextColumn(disabled=True),
                 },
             )
             edited_df["Effect Size (Cohen's d, approx.)"] = edited_df["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
             df = edited_df
+
+            summary_bits = []
+            if parsed_trinetx_rows:
+                n_km = sum(1 for r in parsed_trinetx_rows if r.get("TriNetX Table Type") == "Kaplan-Meier")
+                n_moa = sum(1 for r in parsed_trinetx_rows if r.get("TriNetX Table Type") == "Measures of Association")
+                if n_moa:
+                    summary_bits.append(f"{n_moa} MOA file(s)")
+                if n_km:
+                    summary_bits.append(f"{n_km} KM file(s)")
+            if parsed_standard_tables:
+                summary_bits.append(f"{len(parsed_standard_tables)} preformatted table(s)")
+            if summary_bits:
+                st.success("Parsed: " + ", ".join(summary_bits))
         else:
             st.error("No usable forest-plot data could be parsed from the uploaded files.")
 
@@ -331,13 +446,8 @@ else:
         "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
     })
     default_data["Effect Size (Cohen's d, approx.)"] = default_data["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
-    default_data = default_data[[
-        "Outcome",
-        "Risk, Odds, or Hazard Ratio",
-        "Effect Size (Cohen's d, approx.)",
-        "Lower CI",
-        "Upper CI",
-    ]]
+    default_data = default_data[required_cols]
+
     if "manual_table" not in st.session_state:
         st.session_state.manual_table = default_data.copy()
 
@@ -364,6 +474,10 @@ else:
     )
     df = st.session_state.manual_table
 
+
+# =========================
+# Plotting
+# =========================
 if df is not None:
     st.sidebar.header("⚙️ Basic Plot Settings")
 
@@ -386,6 +500,11 @@ if df is not None:
         label_offset = st.slider("Label Horizontal Offset", 0.01, 0.3, 0.05)
         use_log = st.checkbox("Use Log Scale for X-axis", value=False)
         axis_padding = st.slider("X-axis Padding (%)", 2, 40, 10)
+        manual_x_axis = st.checkbox(
+            "Specify X-axis range manually",
+            value=False,
+            help="Turn this on to set the plotted X-axis minimum and maximum yourself instead of using automatic padding.",
+        )
         y_axis_padding = st.slider("Y-axis Padding (Rows)", 0.0, 5.0, 1.0, step=0.5)
         cap_height = st.slider("Tick Height (for CI ends)", 0.05, 0.5, 0.18, step=0.01)
         if color_scheme == "Color":
@@ -409,6 +528,33 @@ if df is not None:
         ref_line = 1
 
     x_axis_label = plot_column
+
+    auto_x_min = ci_vals.min() if not ci_vals.empty else None
+    auto_x_max = ci_vals.max() if not ci_vals.empty else None
+    auto_x_span = (auto_x_max - auto_x_min) if auto_x_min is not None and auto_x_max is not None else None
+    default_x_pad = (auto_x_span * (axis_padding / 100)) if auto_x_span is not None and auto_x_span != 0 else 0.1
+
+    if manual_x_axis:
+        x_input_help = "Set the minimum and maximum X-axis values to control the full plotted range."
+        if auto_x_min is None or auto_x_max is None:
+            manual_x_min = st.sidebar.number_input("X-axis minimum", value=0.0, format="%.4f", help=x_input_help)
+            manual_x_max = st.sidebar.number_input("X-axis maximum", value=2.0, format="%.4f", help=x_input_help)
+        else:
+            manual_x_min = st.sidebar.number_input(
+                "X-axis minimum",
+                value=float(auto_x_min - default_x_pad),
+                format="%.4f",
+                help=x_input_help,
+            )
+            manual_x_max = st.sidebar.number_input(
+                "X-axis maximum",
+                value=float(auto_x_max + default_x_pad),
+                format="%.4f",
+                help=x_input_help,
+            )
+    else:
+        manual_x_min = None
+        manual_x_max = None
 
     if st.button("📊 Generate Forest Plot"):
         rows = []
@@ -436,7 +582,14 @@ if df is not None:
             fig, ax = plt.subplots(figsize=(10, max(2.5, len(y_labels) * 0.7)))
             x_min, x_max = ci_vals.min(), ci_vals.max()
             x_pad = (x_max - x_min) * (axis_padding / 100) if x_max != x_min else 0.1
-            ax.set_xlim(x_min - x_pad, x_max + x_pad)
+
+            if manual_x_axis:
+                if manual_x_min >= manual_x_max:
+                    st.error("The X-axis minimum must be smaller than the X-axis maximum.")
+                    st.stop()
+                ax.set_xlim(manual_x_min, manual_x_max)
+            else:
+                ax.set_xlim(x_min - x_pad, x_max + x_pad)
 
             for i, row in enumerate(rows):
                 if row is None:
