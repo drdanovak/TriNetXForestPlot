@@ -48,14 +48,73 @@ def clean_cell(value):
     return text
 
 
+def normalize_text(value):
+    return re.sub(r"[^a-z0-9]+", "", clean_cell(value).lower())
+
+
 def parse_float(value):
     text = clean_cell(value).replace(",", "")
     if text in {"", " ", "nan", "None"}:
         return None
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    # Strip common p-value comparators while preserving the numeric value.
+    text = re.sub(r"^(p\s*[<=>]\s*)", "", text, flags=re.IGNORECASE)
+    text = text.lstrip("<>=≤≥ ")
     try:
         return float(text)
     except Exception:
         return None
+
+
+def parse_p_value(value):
+    """Parse p-values written as .021, 0.021, <.001, p=.03, or p < 0.001."""
+    text = clean_cell(value)
+    if not text:
+        return None
+    text = text.replace(",", "").replace("−", "-").replace("–", "-").replace("—", "-")
+    text = re.sub(r"^p\s*[-_ ]*value\s*[:=]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^p\s*[:=<>≤≥]?\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip().lstrip("<>=≤≥ ")
+    if text.startswith("."):
+        text = "0" + text
+    try:
+        val = float(text)
+        if 0 <= val <= 1:
+            return val
+    except Exception:
+        pass
+    match = re.search(r"(?<!\d)(?:0?\.\d+|1(?:\.0+)?)(?!\d)", text)
+    if match:
+        try:
+            val = float(match.group(0))
+            if 0 <= val <= 1:
+                return val
+        except Exception:
+            return None
+    return None
+
+
+def parse_ci_bounds(value):
+    """Return lower/upper CI bounds from cells like '0.56–0.96', '(0.56, 0.96)', or '95% CI: 0.56 - 0.96'."""
+    text = clean_cell(value)
+    if not text:
+        return None, None
+    # Remove a leading 95% if the CI label was included in the value cell.
+    text_for_numbers = re.sub(r"\b95\s*%", "", text, flags=re.IGNORECASE)
+    # In ratio tables, a dash/en dash between two numbers is almost always a range
+    # delimiter, not a negative sign. Convert that delimiter before numeric parsing.
+    text_for_numbers = re.sub(r"(?<=\d)\s*[\-–—−]\s*(?=\d|\.)", ",", text_for_numbers)
+    text_for_numbers = text_for_numbers.replace("−", "-").replace("–", ",").replace("—", ",")
+    numbers = re.findall(r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?", text_for_numbers)
+    parsed = []
+    for n in numbers:
+        try:
+            parsed.append(float("0" + n if n.startswith(".") else n))
+        except Exception:
+            pass
+    if len(parsed) >= 2:
+        return parsed[0], parsed[1]
+    return None, None
 
 
 def next_nonblank_row(rows, start_idx):
@@ -70,48 +129,128 @@ def next_nonblank_row(rows, start_idx):
 # =========================
 def extract_section_triplet(rows, section_name):
     """
-    Extract the point estimate, CI, and optional p value from a TriNetX section.
+    Extract point estimate, confidence interval, and p value from a TriNetX
+    Risk Ratio, Odds Ratio, or Hazard Ratio section.
 
-    TriNetX exports are not always perfectly consistent across MOA/KM tables,
-    so this function first uses column headers when available and then falls
-    back to the first three numeric values for estimate/lower/upper. If a p
-    column is present, it is preserved for the forest/table hybrid.
+    This is intentionally defensive because TriNetX exports vary by module and
+    file type. Some files store lower and upper CI limits in separate columns,
+    while others store the 95% CI in a single text cell such as "0.56–0.96".
+    Likewise, the p-value may be labeled "p", "p-value", "p value", or may be
+    the final numeric value in the section row.
     """
-    for i, row in enumerate(rows):
+
+    section_norm = normalize_text(section_name)
+
+    def is_section_row(row):
         first = clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
-        if first == section_name:
-            header_idx = next_nonblank_row(rows, i + 1)
-            data_idx = next_nonblank_row(rows, (header_idx + 1) if header_idx is not None else i + 1)
-            if data_idx is None:
-                return None
+        return normalize_text(first) == section_norm
 
-            headers = [clean_cell(x) for x in rows[header_idx]] if header_idx is not None else []
-            values = [clean_cell(x) for x in rows[data_idx]]
-            numeric_values = [parse_float(cell) for cell in values]
-            numeric_values = [x for x in numeric_values if x is not None]
+    def header_role(header):
+        h = normalize_text(header)
+        if h in {"p", "pvalue", "pval", "probability"} or "pvalue" in h:
+            return "p"
+        if ("lower" in h or "low" in h or "lcl" in h) and ("ci" in h or "confidence" in h or "95" in h or "limit" in h):
+            return "lower"
+        if ("upper" in h or "up" in h or "ucl" in h) and ("ci" in h or "confidence" in h or "95" in h or "limit" in h):
+            return "upper"
+        if ("95" in h or "ci" in h or "confidenceinterval" in h or "confidence" in h) and "lower" not in h and "upper" not in h:
+            return "ci"
+        if h in {section_norm, "value", "estimate", "pointestimate", "ratio"} or section_norm in h:
+            return "estimate"
+        if "z" in h and len(h) <= 12:
+            return "z"
+        return "other"
 
-            p_value = np.nan
-            for h, v in zip(headers, values):
-                normalized_h = re.sub(r"[^a-z0-9]+", "", h.lower())
-                if normalized_h in {"p", "pvalue", "pval"}:
-                    parsed_p = parse_float(v)
-                    if parsed_p is not None:
-                        p_value = parsed_p
+    for i, row in enumerate(rows):
+        if not is_section_row(row):
+            continue
+
+        header_idx = next_nonblank_row(rows, i + 1)
+        data_idx = next_nonblank_row(rows, (header_idx + 1) if header_idx is not None else i + 1)
+        if data_idx is None:
+            return None
+
+        headers = [clean_cell(x) for x in rows[header_idx]] if header_idx is not None else []
+        values = [clean_cell(x) for x in rows[data_idx]]
+
+        estimate = lower = upper = p_value = None
+
+        # Header-driven extraction first. This prevents z statistics or p-values
+        # from being mistaken for confidence limits when CI is provided as text.
+        for h, v in zip(headers, values):
+            role = header_role(h)
+            if role == "estimate" and estimate is None:
+                estimate = parse_float(v)
+            elif role == "lower" and lower is None:
+                lower = parse_float(v)
+            elif role == "upper" and upper is None:
+                upper = parse_float(v)
+            elif role == "ci" and (lower is None or upper is None):
+                parsed_lower, parsed_upper = parse_ci_bounds(v)
+                if parsed_lower is not None and parsed_upper is not None:
+                    lower, upper = parsed_lower, parsed_upper
+            elif role == "p" and p_value is None:
+                p_value = parse_p_value(v)
+
+        # If the estimate was not labeled, use the first numeric field in the
+        # data row that is not obviously a p-value-only string.
+        if estimate is None:
+            for v in values:
+                parsed = parse_float(v)
+                if parsed is not None:
+                    estimate = parsed
+                    break
+
+        # If the CI was stored as a single unlabelled cell, find the first cell
+        # containing two plausible numeric bounds.
+        if lower is None or upper is None:
+            for v in values:
+                parsed_lower, parsed_upper = parse_ci_bounds(v)
+                if parsed_lower is not None and parsed_upper is not None:
+                    # Avoid treating an estimate/p-value pair as a CI unless the
+                    # cell contains a visible range delimiter or parentheses.
+                    if any(token in clean_cell(v) for token in ["-", "–", "—", ",", "(", ")", "["]):
+                        lower, upper = parsed_lower, parsed_upper
                         break
 
-            if pd.isna(p_value) and len(numeric_values) >= 4:
-                # Many TriNetX exports place p as the final numeric field in a section.
-                p_value = numeric_values[-1]
+        # Numeric fallback for the common wide-table format:
+        # estimate, lower CI, upper CI, z, p OR estimate, lower CI, upper CI, p.
+        numeric_values = [parse_float(cell) for cell in values]
+        numeric_values = [x for x in numeric_values if x is not None]
+        if estimate is None and len(numeric_values) >= 1:
+            estimate = numeric_values[0]
+        if (lower is None or upper is None) and len(numeric_values) >= 3:
+            lower, upper = numeric_values[1], numeric_values[2]
 
-            if len(numeric_values) >= 3:
-                return {
-                    "estimate": numeric_values[0],
-                    "lower": numeric_values[1],
-                    "upper": numeric_values[2],
-                    "p": p_value,
-                }
+        # p-value fallback. Prefer a header-labeled p-value; otherwise use the
+        # final numeric field when it is a plausible p-value and not one of the
+        # CI bounds. This catches TriNetX Risk Ratio and Odds Ratio sections.
+        if p_value is None:
+            for h, v in zip(headers, values):
+                if header_role(h) == "p":
+                    p_value = parse_p_value(v)
+                    break
+        if p_value is None and len(numeric_values) >= 4:
+            candidate = numeric_values[-1]
+            if 0 <= candidate <= 1:
+                p_value = candidate
+        if p_value is None:
+            # Last resort: look for cells explicitly written as p=.021 or p < .001.
+            for v in values:
+                if re.search(r"\bp\s*[-_ ]*(value)?\s*[<=>:]", clean_cell(v), flags=re.IGNORECASE):
+                    p_value = parse_p_value(v)
+                    if p_value is not None:
+                        break
+
+        if estimate is not None and lower is not None and upper is not None:
+            return {
+                "estimate": estimate,
+                "lower": lower,
+                "upper": upper,
+                "p": p_value if p_value is not None else np.nan,
+            }
+
     return None
-
 
 def extract_section_value_map(rows, section_name):
     for i, row in enumerate(rows):
@@ -713,7 +852,7 @@ if input_mode == "📤 Upload file(s)":
             st.subheader("Parsed data preview")
             st.caption(
                 "You can edit outcome labels, reorder rows, or insert section headers using ## before a label. "
-                "KM uploads populate hazard ratios and preserve log-rank / proportionality p-values as metadata."
+                "MOA uploads now try to extract the p-value attached to the selected Risk Ratio or Odds Ratio; KM uploads populate hazard ratios and preserve log-rank / proportionality p-values as metadata."
             )
             editable_cols = required_cols + optional_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]
             edited_df = st.data_editor(
