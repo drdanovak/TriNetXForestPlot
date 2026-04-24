@@ -57,24 +57,32 @@ def parse_float(value):
     if text in {"", " ", "nan", "None"}:
         return None
     text = text.replace("−", "-").replace("–", "-").replace("—", "-")
-    # Strip common p-value comparators while preserving the numeric value.
-    text = re.sub(r"^(p\s*[<=>]\s*)", "", text, flags=re.IGNORECASE)
-    text = text.lstrip("<>=≤≥ ")
+    text = re.sub(r"^(p\s*[-_ ]*(value)?\s*[<=>:=]\s*)", "", text, flags=re.IGNORECASE)
+    text = text.strip().lstrip("<>=≤≥ ").rstrip("*†‡;,")
+    if text.startswith("."):
+        text = "0" + text
     try:
         return float(text)
     except Exception:
+        match = re.search(r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?", text)
+        if match:
+            try:
+                token = match.group(0)
+                return float("0" + token if token.startswith(".") else token)
+            except Exception:
+                return None
         return None
 
 
 def parse_p_value(value):
-    """Parse p-values written as .021, 0.021, <.001, p=.03, or p < 0.001."""
+    """Parse p-values written as .021, 0.021, <.001, p=.03, p < 0.001, or 2.1E-02."""
     text = clean_cell(value)
     if not text:
         return None
     text = text.replace(",", "").replace("−", "-").replace("–", "-").replace("—", "-")
     text = re.sub(r"^p\s*[-_ ]*value\s*[:=]?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^p\s*[:=<>≤≥]?\s*", "", text, flags=re.IGNORECASE)
-    text = text.strip().lstrip("<>=≤≥ ")
+    text = text.strip().lstrip("<>=≤≥ ").rstrip("*†‡;,")
     if text.startswith("."):
         text = "0" + text
     try:
@@ -83,15 +91,32 @@ def parse_p_value(value):
             return val
     except Exception:
         pass
-    match = re.search(r"(?<!\d)(?:0?\.\d+|1(?:\.0+)?)(?!\d)", text)
+    match = re.search(r"(?<!\d)(?:0?\.\d+|1(?:\.0+)?|\d+(?:\.\d+)?[eE][-+]?\d+)(?!\d)", text)
     if match:
         try:
-            val = float(match.group(0))
+            token = match.group(0)
+            val = float("0" + token if token.startswith(".") else token)
             if 0 <= val <= 1:
                 return val
         except Exception:
             return None
     return None
+
+
+def extract_all_numbers(value):
+    """Return every numeric token in a cell, including values embedded in CI strings."""
+    text = clean_cell(value)
+    if not text:
+        return []
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    numbers = re.findall(r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?", text)
+    parsed = []
+    for token in numbers:
+        try:
+            parsed.append(float("0" + token if token.startswith(".") else token))
+        except Exception:
+            pass
+    return parsed
 
 
 def parse_ci_bounds(value):
@@ -130,55 +155,77 @@ def next_nonblank_row(rows, start_idx):
 def extract_section_triplet(rows, section_name):
     """
     Extract point estimate, confidence interval, and p value from a TriNetX
-    Risk Ratio, Odds Ratio, or Hazard Ratio section.
+    effect-estimate section. This version is deliberately tolerant of the
+    two formats TriNetX commonly exports:
 
-    This is intentionally defensive because TriNetX exports vary by module and
-    file type. Some files store lower and upper CI limits in separate columns,
-    while others store the 95% CI in a single text cell such as "0.56–0.96".
-    Likewise, the p-value may be labeled "p", "p-value", "p value", or may be
-    the final numeric value in the section row.
+    1) a header row followed by a data row:
+       Risk Ratio | 95% CI | z | p
+       0.76       | 0.60–0.95 | -2.39 | .017
+
+    2) CSVs in which the CI cell was split at the comma:
+       Risk Ratio | 95% CI | z | p
+       0.76       | 0.60   | 0.95 | -2.39 | .017
+
+    It also captures a labeled p-value from nearby rows when the value is not
+    aligned under the p header.
     """
 
     section_norm = normalize_text(section_name)
+    known_sections = {
+        "riskdifference",
+        "riskratio",
+        "oddsratio",
+        "hazardratio",
+        "logranktest",
+        "proportionality",
+        "cohort",
+        "summary",
+    }
+
+    def first_nonblank(row):
+        return clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
 
     def is_section_row(row):
-        first = clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
-        return normalize_text(first) == section_norm
+        first = first_nonblank(row)
+        norm = normalize_text(first)
+        return norm == section_norm or first.lower().strip() == section_name.lower().strip()
+
+    def is_new_section(row):
+        first = first_nonblank(row)
+        norm = normalize_text(first)
+        return norm in known_sections
 
     def header_role(header):
         h = normalize_text(header)
-        if h in {"p", "pvalue", "pval", "probability"} or "pvalue" in h:
+        if h in {"p", "pvalue", "pval", "probability", "prob"} or "pvalue" in h or h == "pvalue2sided":
             return "p"
+        if "zstat" in h or h in {"z", "zscore", "zstatistic"}:
+            return "z"
         if ("lower" in h or "low" in h or "lcl" in h) and ("ci" in h or "confidence" in h or "95" in h or "limit" in h):
             return "lower"
         if ("upper" in h or "up" in h or "ucl" in h) and ("ci" in h or "confidence" in h or "95" in h or "limit" in h):
             return "upper"
         if ("95" in h or "ci" in h or "confidenceinterval" in h or "confidence" in h) and "lower" not in h and "upper" not in h:
             return "ci"
-        if h in {section_norm, "value", "estimate", "pointestimate", "ratio"} or section_norm in h:
+        if h in {section_norm, "value", "estimate", "pointestimate", "ratio", "effectestimate", "measure"} or section_norm in h:
             return "estimate"
-        if "z" in h and len(h) <= 12:
-            return "z"
         return "other"
 
-    for i, row in enumerate(rows):
-        if not is_section_row(row):
-            continue
+    def row_has_header(row):
+        roles = [header_role(cell) for cell in row if clean_cell(cell)]
+        return any(role in roles for role in ["estimate", "ci", "lower", "upper", "p", "z"])
 
-        header_idx = next_nonblank_row(rows, i + 1)
-        data_idx = next_nonblank_row(rows, (header_idx + 1) if header_idx is not None else i + 1)
-        if data_idx is None:
-            return None
+    def row_has_numeric(row):
+        return any(extract_all_numbers(cell) for cell in row)
 
-        headers = [clean_cell(x) for x in rows[header_idx]] if header_idx is not None else []
-        values = [clean_cell(x) for x in rows[data_idx]]
-
+    def parse_from_rows(headers, values, nearby_rows=None):
+        nearby_rows = nearby_rows or []
         estimate = lower = upper = p_value = None
 
-        # Header-driven extraction first. This prevents z statistics or p-values
-        # from being mistaken for confidence limits when CI is provided as text.
-        for h, v in zip(headers, values):
+        # Header-guided extraction.
+        for idx, h in enumerate(headers):
             role = header_role(h)
+            v = values[idx] if idx < len(values) else ""
             if role == "estimate" and estimate is None:
                 estimate = parse_float(v)
             elif role == "lower" and lower is None:
@@ -189,56 +236,81 @@ def extract_section_triplet(rows, section_name):
                 parsed_lower, parsed_upper = parse_ci_bounds(v)
                 if parsed_lower is not None and parsed_upper is not None:
                     lower, upper = parsed_lower, parsed_upper
+                elif idx + 1 < len(values):
+                    # Handles CSVs where a CI like "0.60,0.95" was split into
+                    # two cells under one CI header.
+                    l_tmp = parse_float(values[idx])
+                    u_tmp = parse_float(values[idx + 1])
+                    if l_tmp is not None and u_tmp is not None:
+                        lower, upper = l_tmp, u_tmp
             elif role == "p" and p_value is None:
                 p_value = parse_p_value(v)
+                if p_value is None and len(values) > len(headers):
+                    # In malformed CSVs, the p value is often shifted right
+                    # because the CI cell split at its comma. The last cell is
+                    # usually the p value in TriNetX MOA rows.
+                    p_value = parse_p_value(values[-1])
 
-        # If the estimate was not labeled, use the first numeric field in the
-        # data row that is not obviously a p-value-only string.
-        if estimate is None:
-            for v in values:
-                parsed = parse_float(v)
-                if parsed is not None:
-                    estimate = parsed
-                    break
+        # Explicit p-value patterns anywhere in the row, e.g. "p=.021".
+        if p_value is None:
+            for idx, v in enumerate(values):
+                cell = clean_cell(v)
+                if re.search(r"\bp\s*[-_ ]*(value)?\s*[<=>:]", cell, flags=re.IGNORECASE):
+                    p_value = parse_p_value(cell)
+                    if p_value is not None:
+                        break
+                # Also handle two-cell "p", ".021" layouts.
+                if normalize_text(cell) in {"p", "pvalue", "pval"} and idx + 1 < len(values):
+                    p_value = parse_p_value(values[idx + 1])
+                    if p_value is not None:
+                        break
 
-        # If the CI was stored as a single unlabelled cell, find the first cell
-        # containing two plausible numeric bounds.
+        # Parse CI from any cell that visibly contains a range.
         if lower is None or upper is None:
             for v in values:
-                parsed_lower, parsed_upper = parse_ci_bounds(v)
+                cell = clean_cell(v)
+                parsed_lower, parsed_upper = parse_ci_bounds(cell)
                 if parsed_lower is not None and parsed_upper is not None:
-                    # Avoid treating an estimate/p-value pair as a CI unless the
-                    # cell contains a visible range delimiter or parentheses.
-                    if any(token in clean_cell(v) for token in ["-", "–", "—", ",", "(", ")", "["]):
+                    if any(token in cell for token in ["-", "–", "—", ",", "(", ")", "[", "]"]):
                         lower, upper = parsed_lower, parsed_upper
                         break
 
-        # Numeric fallback for the common wide-table format:
-        # estimate, lower CI, upper CI, z, p OR estimate, lower CI, upper CI, p.
-        numeric_values = [parse_float(cell) for cell in values]
-        numeric_values = [x for x in numeric_values if x is not None]
-        if estimate is None and len(numeric_values) >= 1:
-            estimate = numeric_values[0]
-        if (lower is None or upper is None) and len(numeric_values) >= 3:
-            lower, upper = numeric_values[1], numeric_values[2]
+        # Numeric fallback using every numeric token, including numbers inside a
+        # single CI cell. This is the critical p-value fix: in a row like
+        # 0.76 | 0.60 | 0.95 | -2.39 | .017, the final numeric token is the p.
+        all_numbers = []
+        for v in values:
+            all_numbers.extend(extract_all_numbers(v))
 
-        # p-value fallback. Prefer a header-labeled p-value; otherwise use the
-        # final numeric field when it is a plausible p-value and not one of the
-        # CI bounds. This catches TriNetX Risk Ratio and Odds Ratio sections.
-        if p_value is None:
-            for h, v in zip(headers, values):
-                if header_role(h) == "p":
-                    p_value = parse_p_value(v)
-                    break
-        if p_value is None and len(numeric_values) >= 4:
-            candidate = numeric_values[-1]
+        if estimate is None and all_numbers:
+            estimate = all_numbers[0]
+
+        if (lower is None or upper is None) and len(all_numbers) >= 3:
+            lower, upper = all_numbers[1], all_numbers[2]
+
+        if p_value is None and len(all_numbers) >= 4:
+            candidate = all_numbers[-1]
+            # Do not accept a z statistic or a ratio estimate as p. p-values
+            # must be in [0, 1]. This catches .021, 0.021, 2.1e-2, and 1.0.
             if 0 <= candidate <= 1:
                 p_value = candidate
+
+        # Nearby-row fallback for exports that place "p-value" on a separate
+        # line after the effect-estimate row.
         if p_value is None:
-            # Last resort: look for cells explicitly written as p=.021 or p < .001.
-            for v in values:
-                if re.search(r"\bp\s*[-_ ]*(value)?\s*[<=>:]", clean_cell(v), flags=re.IGNORECASE):
-                    p_value = parse_p_value(v)
+            for near in nearby_rows:
+                near_cells = [clean_cell(x) for x in near]
+                near_text = " ".join(near_cells)
+                if re.search(r"\bp\s*[-_ ]*(value)?\b", near_text, flags=re.IGNORECASE):
+                    for idx, cell in enumerate(near_cells):
+                        if normalize_text(cell) in {"p", "pvalue", "pval"} and idx + 1 < len(near_cells):
+                            p_value = parse_p_value(near_cells[idx + 1])
+                            if p_value is not None:
+                                break
+                        if re.search(r"\bp\s*[-_ ]*(value)?\s*[<=>:]", cell, flags=re.IGNORECASE):
+                            p_value = parse_p_value(cell)
+                            if p_value is not None:
+                                break
                     if p_value is not None:
                         break
 
@@ -249,8 +321,58 @@ def extract_section_triplet(rows, section_name):
                 "upper": upper,
                 "p": p_value if p_value is not None else np.nan,
             }
+        return None
+
+    for i, row in enumerate(rows):
+        if not is_section_row(row):
+            continue
+
+        # Capture the section window until the next recognized section. This is
+        # more robust than assuming a single header row and data row.
+        section_window = []
+        for j in range(i + 1, min(len(rows), i + 12)):
+            if j > i + 1 and is_new_section(rows[j]):
+                break
+            if any(clean_cell(cell) for cell in rows[j]):
+                section_window.append(rows[j])
+
+        if not section_window:
+            continue
+
+        # Locate a plausible header and the first numeric row after it.
+        header_idx = None
+        for local_idx, candidate in enumerate(section_window):
+            if row_has_header(candidate):
+                header_idx = local_idx
+                break
+
+        if header_idx is not None:
+            headers = [clean_cell(x) for x in section_window[header_idx]]
+            candidate_rows = section_window[header_idx + 1:] or section_window[header_idx:header_idx + 1]
+        else:
+            headers = []
+            candidate_rows = section_window
+
+        for local_idx, candidate in enumerate(candidate_rows):
+            if not row_has_numeric(candidate):
+                continue
+            values = [clean_cell(x) for x in candidate]
+            nearby = candidate_rows[local_idx + 1:local_idx + 4]
+            parsed = parse_from_rows(headers, values, nearby_rows=nearby)
+            if parsed is not None:
+                return parsed
+
+        # Last resort: flatten the entire section. This handles unusual exports
+        # where headers and values are not consistently row-delimited.
+        flattened_values = []
+        for section_row in section_window:
+            flattened_values.extend([clean_cell(x) for x in section_row if clean_cell(x)])
+        parsed = parse_from_rows([], flattened_values, nearby_rows=[])
+        if parsed is not None:
+            return parsed
 
     return None
+
 
 def extract_section_value_map(rows, section_name):
     for i, row in enumerate(rows):
@@ -345,6 +467,7 @@ def parse_trinetx_effect_rows(rows, filename, raw_text):
     title = extract_title_from_rows(rows)
     table_type = detect_trinetx_table_type(title, raw_text)
 
+    risk_difference = extract_section_triplet(rows, "Risk Difference")
     risk_ratio = extract_section_triplet(rows, "Risk Ratio")
     odds_ratio = extract_section_triplet(rows, "Odds Ratio")
     hazard_ratio = extract_section_triplet(rows, "Hazard Ratio")
@@ -360,6 +483,10 @@ def parse_trinetx_effect_rows(rows, filename, raw_text):
         "Original Title": clean_title(title),
         "Source File": filename,
         "TriNetX Table Type": table_type,
+        "Risk Difference": risk_difference["estimate"] if risk_difference else np.nan,
+        "RD Lower CI": risk_difference["lower"] if risk_difference else np.nan,
+        "RD Upper CI": risk_difference["upper"] if risk_difference else np.nan,
+        "RD p": risk_difference.get("p", np.nan) if risk_difference else np.nan,
         "Risk Ratio": risk_ratio["estimate"] if risk_ratio else np.nan,
         "RR Lower CI": risk_ratio["lower"] if risk_ratio else np.nan,
         "RR Upper CI": risk_ratio["upper"] if risk_ratio else np.nan,
@@ -473,18 +600,30 @@ def choose_effect_for_row(row, preferred_measure):
         if candidate not in measure_priority:
             measure_priority.append(candidate)
 
+    def fallback_association_p(primary_p, primary_label):
+        if pd.notnull(primary_p):
+            return primary_p, primary_label
+        rd_p = row.get("RD p", np.nan)
+        if pd.notnull(rd_p):
+            return rd_p, "Risk Difference p fallback"
+        return np.nan, ""
+
     for candidate in measure_priority:
         if candidate == "Risk Ratio" and pd.notnull(row.get("Risk Ratio", np.nan)):
-            return candidate, row["Risk Ratio"], row["RR Lower CI"], row["RR Upper CI"], row.get("RR p", np.nan)
+            p_value, p_source = fallback_association_p(row.get("RR p", np.nan), "Risk Ratio p")
+            return candidate, row["Risk Ratio"], row["RR Lower CI"], row["RR Upper CI"], p_value, p_source
         if candidate == "Odds Ratio" and pd.notnull(row.get("Odds Ratio", np.nan)):
-            return candidate, row["Odds Ratio"], row["OR Lower CI"], row["OR Upper CI"], row.get("OR p", np.nan)
+            p_value, p_source = fallback_association_p(row.get("OR p", np.nan), "Odds Ratio p")
+            return candidate, row["Odds Ratio"], row["OR Lower CI"], row["OR Upper CI"], p_value, p_source
         if candidate == "Hazard Ratio" and pd.notnull(row.get("Hazard Ratio", np.nan)):
             p_value = row.get("HR p", np.nan)
+            p_source = "Hazard Ratio p" if pd.notnull(p_value) else ""
             if pd.isna(p_value):
                 p_value = row.get("Log-Rank p", np.nan)
-            return candidate, row["Hazard Ratio"], row["HR Lower CI"], row["HR Upper CI"], p_value
+                p_source = "Log-Rank p" if pd.notnull(p_value) else ""
+            return candidate, row["Hazard Ratio"], row["HR Lower CI"], row["HR Upper CI"], p_value, p_source
 
-    return None, np.nan, np.nan, np.nan, np.nan
+    return None, np.nan, np.nan, np.nan, np.nan, ""
 
 
 def deduplicate_outcome_labels(df):
@@ -511,7 +650,7 @@ def build_plot_table_from_trinetx(parsed_rows, preferred_measure):
     out_rows = []
 
     for row in parsed_rows:
-        chosen_measure, estimate, lower, upper, p_value = choose_effect_for_row(row, preferred_measure)
+        chosen_measure, estimate, lower, upper, p_value, p_source = choose_effect_for_row(row, preferred_measure)
         out_rows.append({
             "Outcome": row["Outcome"],
             "Risk, Odds, or Hazard Ratio": estimate,
@@ -519,7 +658,12 @@ def build_plot_table_from_trinetx(parsed_rows, preferred_measure):
             "Lower CI": lower,
             "Upper CI": upper,
             "p": p_value,
+            "p Source": p_source,
             "Effect Type": chosen_measure,
+            "RR p": row.get("RR p", np.nan),
+            "OR p": row.get("OR p", np.nan),
+            "RD p": row.get("RD p", np.nan),
+            "HR p": row.get("HR p", np.nan),
             "TriNetX Table Type": row["TriNetX Table Type"],
             "Log-Rank p": row.get("Log-Rank p", np.nan),
             "PH Assumption p": row.get("PH Assumption p", np.nan),
@@ -831,20 +975,25 @@ if input_mode == "📤 Upload file(s)":
         if parsed_trinetx_rows:
             trinetx_df = build_plot_table_from_trinetx(parsed_trinetx_rows, preferred_measure)
             assembled_tables.append(
-                trinetx_df[required_cols + optional_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
+                trinetx_df[required_cols + optional_cols + ["p Source", "RR p", "OR p", "RD p", "HR p", "Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
             )
         if parsed_standard_tables:
             for table in parsed_standard_tables:
                 table = table.copy()
                 if "p" not in table.columns:
                     table["p"] = np.nan
+                table["p Source"] = np.nan
+                table["RR p"] = np.nan
+                table["OR p"] = np.nan
+                table["RD p"] = np.nan
+                table["HR p"] = np.nan
                 table["Effect Type"] = np.nan
                 table["TriNetX Table Type"] = np.nan
                 table["Log-Rank p"] = np.nan
                 table["PH Assumption p"] = np.nan
                 table["Source File"] = np.nan
                 assembled_tables.append(
-                    table[required_cols + optional_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
+                    table[required_cols + optional_cols + ["p Source", "RR p", "OR p", "RD p", "HR p", "Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
                 )
 
         if assembled_tables:
@@ -852,9 +1001,10 @@ if input_mode == "📤 Upload file(s)":
             st.subheader("Parsed data preview")
             st.caption(
                 "You can edit outcome labels, reorder rows, or insert section headers using ## before a label. "
-                "MOA uploads now try to extract the p-value attached to the selected Risk Ratio or Odds Ratio; KM uploads populate hazard ratios and preserve log-rank / proportionality p-values as metadata."
+                "MOA uploads now extract the p-value from the selected Risk Ratio or Odds Ratio row when it is present. "
+                "If the selected row does not contain a p-value, the app falls back to the Risk Difference p-value and records that in p Source."
             )
-            editable_cols = required_cols + optional_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]
+            editable_cols = required_cols + optional_cols + ["p Source", "RR p", "OR p", "RD p", "HR p", "Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]
             edited_df = st.data_editor(
                 combined_df[editable_cols],
                 num_rows="dynamic",
@@ -867,6 +1017,11 @@ if input_mode == "📤 Upload file(s)":
                         help="Auto-calculated as ln(RR/OR/HR) × sqrt(3)/π",
                     ),
                     "p": st.column_config.NumberColumn("p", format="%.4g"),
+                    "p Source": st.column_config.TextColumn(disabled=True),
+                    "RR p": st.column_config.NumberColumn(disabled=True, format="%.4g"),
+                    "OR p": st.column_config.NumberColumn(disabled=True, format="%.4g"),
+                    "RD p": st.column_config.NumberColumn(disabled=True, format="%.4g"),
+                    "HR p": st.column_config.NumberColumn(disabled=True, format="%.4g"),
                     "Effect Type": st.column_config.TextColumn(disabled=True),
                     "TriNetX Table Type": st.column_config.TextColumn(disabled=True),
                     "Log-Rank p": st.column_config.NumberColumn(disabled=True, format="%.4g"),
