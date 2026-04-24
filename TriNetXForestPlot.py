@@ -4,11 +4,14 @@ import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
+from matplotlib.transforms import blended_transform_factory
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-plt.style.use("seaborn-v0_8-whitegrid")
+plt.style.use("default")
 st.set_page_config(layout="wide")
 st.title("🌲 Novak's TriNetX Forest Plot Generator")
 
@@ -19,6 +22,7 @@ required_cols = [
     "Lower CI",
     "Upper CI",
 ]
+optional_cols = ["p"]
 
 
 # =========================
@@ -65,6 +69,14 @@ def next_nonblank_row(rows, start_idx):
 # TriNetX parsing helpers
 # =========================
 def extract_section_triplet(rows, section_name):
+    """
+    Extract the point estimate, CI, and optional p value from a TriNetX section.
+
+    TriNetX exports are not always perfectly consistent across MOA/KM tables,
+    so this function first uses column headers when available and then falls
+    back to the first three numeric values for estimate/lower/upper. If a p
+    column is present, it is preserved for the forest/table hybrid.
+    """
     for i, row in enumerate(rows):
         first = clean_cell(next((cell for cell in row if clean_cell(cell)), ""))
         if first == section_name:
@@ -72,13 +84,31 @@ def extract_section_triplet(rows, section_name):
             data_idx = next_nonblank_row(rows, (header_idx + 1) if header_idx is not None else i + 1)
             if data_idx is None:
                 return None
-            numeric_values = [parse_float(cell) for cell in rows[data_idx]]
+
+            headers = [clean_cell(x) for x in rows[header_idx]] if header_idx is not None else []
+            values = [clean_cell(x) for x in rows[data_idx]]
+            numeric_values = [parse_float(cell) for cell in values]
             numeric_values = [x for x in numeric_values if x is not None]
+
+            p_value = np.nan
+            for h, v in zip(headers, values):
+                normalized_h = re.sub(r"[^a-z0-9]+", "", h.lower())
+                if normalized_h in {"p", "pvalue", "pval"}:
+                    parsed_p = parse_float(v)
+                    if parsed_p is not None:
+                        p_value = parsed_p
+                        break
+
+            if pd.isna(p_value) and len(numeric_values) >= 4:
+                # Many TriNetX exports place p as the final numeric field in a section.
+                p_value = numeric_values[-1]
+
             if len(numeric_values) >= 3:
                 return {
                     "estimate": numeric_values[0],
                     "lower": numeric_values[1],
                     "upper": numeric_values[2],
+                    "p": p_value,
                 }
     return None
 
@@ -194,12 +224,15 @@ def parse_trinetx_effect_rows(rows, filename, raw_text):
         "Risk Ratio": risk_ratio["estimate"] if risk_ratio else np.nan,
         "RR Lower CI": risk_ratio["lower"] if risk_ratio else np.nan,
         "RR Upper CI": risk_ratio["upper"] if risk_ratio else np.nan,
+        "RR p": risk_ratio.get("p", np.nan) if risk_ratio else np.nan,
         "Odds Ratio": odds_ratio["estimate"] if odds_ratio else np.nan,
         "OR Lower CI": odds_ratio["lower"] if odds_ratio else np.nan,
         "OR Upper CI": odds_ratio["upper"] if odds_ratio else np.nan,
+        "OR p": odds_ratio.get("p", np.nan) if odds_ratio else np.nan,
         "Hazard Ratio": hazard_ratio["estimate"] if hazard_ratio else np.nan,
         "HR Lower CI": hazard_ratio["lower"] if hazard_ratio else np.nan,
         "HR Upper CI": hazard_ratio["upper"] if hazard_ratio else np.nan,
+        "HR p": hazard_ratio.get("p", np.nan) if hazard_ratio else np.nan,
         "Log-Rank p": parse_float(log_rank.get("p")) if log_rank else np.nan,
         "PH Assumption p": parse_float(proportionality.get("p")) if proportionality else np.nan,
     }
@@ -210,7 +243,16 @@ def parse_trinetx_effect_rows(rows, filename, raw_text):
 # =========================
 def standardize_existing_forest_table(df):
     working = df.copy()
-    for col in required_cols:
+
+    # Preserve common p-value column names if users upload a preformatted table.
+    if "p" not in working.columns:
+        p_aliases = {"p", "p value", "p-value", "p_value", "pvalue", "P", "P value", "P-value"}
+        for col in list(working.columns):
+            if str(col).strip() in p_aliases:
+                working = working.rename(columns={col: "p"})
+                break
+
+    for col in required_cols + optional_cols:
         if col not in working.columns:
             working[col] = np.nan
 
@@ -219,6 +261,7 @@ def standardize_existing_forest_table(df):
         "Lower CI",
         "Upper CI",
         "Effect Size (Cohen's d, approx.)",
+        "p",
     ]
     for col in numeric_cols:
         working[col] = pd.to_numeric(working[col], errors="coerce")
@@ -226,7 +269,7 @@ def standardize_existing_forest_table(df):
     if working["Effect Size (Cohen's d, approx.)"].isna().all():
         working["Effect Size (Cohen's d, approx.)"] = working["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
 
-    return working[required_cols]
+    return working[required_cols + optional_cols]
 
 
 # =========================
@@ -293,13 +336,16 @@ def choose_effect_for_row(row, preferred_measure):
 
     for candidate in measure_priority:
         if candidate == "Risk Ratio" and pd.notnull(row.get("Risk Ratio", np.nan)):
-            return candidate, row["Risk Ratio"], row["RR Lower CI"], row["RR Upper CI"]
+            return candidate, row["Risk Ratio"], row["RR Lower CI"], row["RR Upper CI"], row.get("RR p", np.nan)
         if candidate == "Odds Ratio" and pd.notnull(row.get("Odds Ratio", np.nan)):
-            return candidate, row["Odds Ratio"], row["OR Lower CI"], row["OR Upper CI"]
+            return candidate, row["Odds Ratio"], row["OR Lower CI"], row["OR Upper CI"], row.get("OR p", np.nan)
         if candidate == "Hazard Ratio" and pd.notnull(row.get("Hazard Ratio", np.nan)):
-            return candidate, row["Hazard Ratio"], row["HR Lower CI"], row["HR Upper CI"]
+            p_value = row.get("HR p", np.nan)
+            if pd.isna(p_value):
+                p_value = row.get("Log-Rank p", np.nan)
+            return candidate, row["Hazard Ratio"], row["HR Lower CI"], row["HR Upper CI"], p_value
 
-    return None, np.nan, np.nan, np.nan
+    return None, np.nan, np.nan, np.nan, np.nan
 
 
 def deduplicate_outcome_labels(df):
@@ -326,13 +372,14 @@ def build_plot_table_from_trinetx(parsed_rows, preferred_measure):
     out_rows = []
 
     for row in parsed_rows:
-        chosen_measure, estimate, lower, upper = choose_effect_for_row(row, preferred_measure)
+        chosen_measure, estimate, lower, upper, p_value = choose_effect_for_row(row, preferred_measure)
         out_rows.append({
             "Outcome": row["Outcome"],
             "Risk, Odds, or Hazard Ratio": estimate,
             "Effect Size (Cohen's d, approx.)": compute_cohens_d(estimate),
             "Lower CI": lower,
             "Upper CI": upper,
+            "p": p_value,
             "Effect Type": chosen_measure,
             "TriNetX Table Type": row["TriNetX Table Type"],
             "Log-Rank p": row.get("Log-Rank p", np.nan),
@@ -388,6 +435,232 @@ def compute_ratio_axis_limits(ci_vals, axis_padding, use_log=False):
     return auto_min, auto_max
 
 
+
+# =========================
+# Forest plot / table hybrid helpers
+# =========================
+def get_row_p_value(row):
+    for col in ["p", "P", "p-value", "P-value", "p value", "P value", "Log-Rank p"]:
+        if col in row.index:
+            value = pd.to_numeric(pd.Series([row.get(col, np.nan)]), errors="coerce").iloc[0]
+            if pd.notnull(value):
+                return value
+    return np.nan
+
+
+def format_p_value(value):
+    value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return ""
+    if value < 0.001:
+        return "<.001"
+    return f"{value:.3f}".replace("0.", ".", 1)
+
+
+def format_number(value, decimals=2):
+    value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return ""
+    return f"{value:.{decimals}f}"
+
+
+def format_ci(lower, upper, decimals=2):
+    lower_text = format_number(lower, decimals)
+    upper_text = format_number(upper, decimals)
+    if not lower_text or not upper_text:
+        return ""
+    return f"{lower_text}–{upper_text}"
+
+
+def infer_significance(effect, lower, upper, p_value, ref_line):
+    p_value = pd.to_numeric(pd.Series([p_value]), errors="coerce").iloc[0]
+    lower = pd.to_numeric(pd.Series([lower]), errors="coerce").iloc[0]
+    upper = pd.to_numeric(pd.Series([upper]), errors="coerce").iloc[0]
+    if pd.notnull(p_value):
+        return p_value < 0.05
+    if pd.notnull(lower) and pd.notnull(upper):
+        return (upper < ref_line) or (lower > ref_line)
+    return False
+
+
+def ratio_column_header(axis_label):
+    label = str(axis_label).lower()
+    if "risk ratio" in label:
+        return "RR"
+    if "odds ratio" in label:
+        return "OR"
+    if "hazard ratio" in label:
+        return "HR"
+    if "effect estimate" in label:
+        return "Estimate"
+    return "Estimate"
+
+
+def build_hybrid_display_rows(df, use_groups=True):
+    display_rows = []
+    inside_group = False
+    for _, row in df.iterrows():
+        outcome = clean_cell(row.get("Outcome", ""))
+        if not outcome:
+            continue
+        if use_groups and outcome.startswith("##"):
+            display_rows.append({"kind": "header", "label": outcome[2:].strip(), "row": None, "indented": False})
+            inside_group = True
+        else:
+            display_rows.append({"kind": "data", "label": outcome, "row": row, "indented": inside_group})
+    return display_rows
+
+
+def create_forest_table_hybrid(
+    df,
+    plot_column,
+    x_measure,
+    x_axis_label,
+    ref_line,
+    x_min,
+    x_max,
+    use_groups=True,
+    use_log=False,
+    show_grid=False,
+    plot_title="",
+    font_size=12,
+    point_size=9,
+    line_width=1.8,
+    cap_height=0.15,
+    header_color="#203F99",
+    significant_color="#1F3D99",
+    nonsignificant_color="#666666",
+):
+    display_rows = build_hybrid_display_rows(df, use_groups=use_groups)
+    if not display_rows:
+        raise ValueError("No rows are available to plot.")
+
+    n_rows = len(display_rows)
+    fig_height = max(3.2, 0.46 * n_rows + 1.25)
+    fig, ax = plt.subplots(figsize=(12, fig_height))
+    fig.subplots_adjust(left=0.30, right=0.76, top=0.90, bottom=0.18)
+
+    if use_log:
+        ax.set_xscale("log")
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(n_rows - 0.35, -0.90)
+    ax.set_yticks([])
+
+    for spine in ["left", "right", "top"]:
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color("#444444")
+    ax.tick_params(axis="x", labelsize=max(font_size - 2, 8), colors="#444444")
+
+    if show_grid:
+        ax.grid(True, axis="x", linestyle=":", linewidth=0.6, alpha=0.7)
+    else:
+        ax.grid(False)
+
+    ax.axvline(ref_line, color="#333333", linewidth=1.15, zorder=1)
+
+    # Mixed transform: x as an axes fraction, y as data coordinate.
+    text_transform = blended_transform_factory(ax.transAxes, ax.transData)
+    left_x = -0.64
+    right_est_x = 1.08
+    right_ci_x = 1.28
+    right_p_x = 1.53
+    header_y = -0.62
+    ratio_header = ratio_column_header(x_axis_label)
+
+    ax.text(right_est_x, header_y, ratio_header, transform=text_transform, ha="center", va="center",
+            fontsize=font_size, weight="bold", clip_on=False)
+    ax.text(right_ci_x, header_y, "95% CI", transform=text_transform, ha="center", va="center",
+            fontsize=font_size, weight="bold", clip_on=False)
+    ax.text(right_p_x, header_y, r"$p$", transform=text_transform, ha="center", va="center",
+            fontsize=font_size, weight="bold", clip_on=False)
+
+    ci_line_color = "#222222"
+    span = x_max - x_min
+    for y, item in enumerate(display_rows):
+        if item["kind"] == "header":
+            # Draw the section bar across the left labels, forest plot, and right table.
+            rect = Rectangle(
+                (left_x - 0.02, y - 0.38),
+                2.25,
+                0.76,
+                transform=text_transform,
+                facecolor=header_color,
+                edgecolor=header_color,
+                clip_on=False,
+                zorder=0,
+            )
+            ax.add_patch(rect)
+            ax.text(left_x, y, item["label"], transform=text_transform, ha="left", va="center",
+                    color="white", fontsize=font_size, weight="bold", clip_on=False, zorder=2)
+            continue
+
+        row = item["row"]
+        label = ("   " + item["label"]) if item["indented"] else item["label"]
+        ax.text(left_x, y, label, transform=text_transform, ha="left", va="center",
+                fontsize=font_size, color="#222222", clip_on=False)
+
+        if x_measure == "Effect Size (Cohen's d, approx.)":
+            effect = pd.to_numeric(pd.Series([row.get("Effect Size (Cohen's d, approx.)", np.nan)]), errors="coerce").iloc[0]
+            lci = compute_cohens_d(row.get("Lower CI", np.nan))
+            uci = compute_cohens_d(row.get("Upper CI", np.nan))
+        else:
+            effect = pd.to_numeric(pd.Series([row.get("Risk, Odds, or Hazard Ratio", np.nan)]), errors="coerce").iloc[0]
+            lci = pd.to_numeric(pd.Series([row.get("Lower CI", np.nan)]), errors="coerce").iloc[0]
+            uci = pd.to_numeric(pd.Series([row.get("Upper CI", np.nan)]), errors="coerce").iloc[0]
+
+        p_value = get_row_p_value(row)
+        significant = infer_significance(effect, lci, uci, p_value, ref_line)
+        marker_color = significant_color if significant else nonsignificant_color
+
+        if pd.notnull(lci) and pd.notnull(uci):
+            clipped_left = max(lci, x_min)
+            clipped_right = min(uci, x_max)
+            ax.hlines(y, xmin=clipped_left, xmax=clipped_right, color=ci_line_color,
+                      linewidth=line_width, zorder=2)
+            if lci >= x_min:
+                ax.vlines(lci, y - cap_height, y + cap_height, color=ci_line_color,
+                          linewidth=line_width, zorder=2)
+            else:
+                ax.annotate("", xy=(x_min, y), xytext=(x_min + 0.06 * span, y),
+                            arrowprops=dict(arrowstyle="<-", color=ci_line_color,
+                                            lw=line_width, shrinkA=0, shrinkB=0),
+                            zorder=2)
+            if uci <= x_max:
+                ax.vlines(uci, y - cap_height, y + cap_height, color=ci_line_color,
+                          linewidth=line_width, zorder=2)
+            else:
+                ax.annotate("", xy=(x_max, y), xytext=(x_max - 0.06 * span, y),
+                            arrowprops=dict(arrowstyle="->", color=ci_line_color,
+                                            lw=line_width, shrinkA=0, shrinkB=0),
+                            zorder=2)
+
+        if pd.notnull(effect) and x_min <= effect <= x_max:
+            ax.plot(effect, y, marker="s", markersize=point_size, color=marker_color,
+                    markeredgecolor=marker_color, zorder=3)
+
+        ax.text(right_est_x, y, format_number(effect, 2), transform=text_transform, ha="center", va="center",
+                fontsize=font_size, color="#222222", clip_on=False)
+        ax.text(right_ci_x, y, format_ci(lci, uci, 2), transform=text_transform, ha="center", va="center",
+                fontsize=font_size, color="#222222", clip_on=False)
+        ax.text(right_p_x, y, format_p_value(p_value), transform=text_transform, ha="center", va="center",
+                fontsize=font_size, color="#222222", clip_on=False)
+
+    ax.set_xlabel(x_axis_label, fontsize=font_size, weight="bold", labelpad=8)
+    if plot_title:
+        ax.set_title(plot_title, fontsize=font_size + 2, weight="bold", pad=12)
+
+    legend_handles = [
+        Line2D([0], [0], marker="s", color="none", markerfacecolor=significant_color,
+               markeredgecolor=significant_color, markersize=8, label="Significant (p < 0.05)"),
+        Line2D([0], [0], marker="s", color="none", markerfacecolor=nonsignificant_color,
+               markeredgecolor=nonsignificant_color, markersize=8, label="Non-significant"),
+    ]
+    ax.legend(handles=legend_handles, loc="lower left", bbox_to_anchor=(-0.02, -0.36),
+              frameon=False, ncol=2, fontsize=max(font_size - 2, 8), handlelength=1.0,
+              columnspacing=2.5, handletextpad=0.4)
+
+    return fig
+
 # =========================
 # App UI
 # =========================
@@ -419,18 +692,20 @@ if input_mode == "📤 Upload file(s)":
         if parsed_trinetx_rows:
             trinetx_df = build_plot_table_from_trinetx(parsed_trinetx_rows, preferred_measure)
             assembled_tables.append(
-                trinetx_df[required_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
+                trinetx_df[required_cols + optional_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
             )
         if parsed_standard_tables:
             for table in parsed_standard_tables:
                 table = table.copy()
+                if "p" not in table.columns:
+                    table["p"] = np.nan
                 table["Effect Type"] = np.nan
                 table["TriNetX Table Type"] = np.nan
                 table["Log-Rank p"] = np.nan
                 table["PH Assumption p"] = np.nan
                 table["Source File"] = np.nan
                 assembled_tables.append(
-                    table[required_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
+                    table[required_cols + optional_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]]
                 )
 
         if assembled_tables:
@@ -440,7 +715,7 @@ if input_mode == "📤 Upload file(s)":
                 "You can edit outcome labels, reorder rows, or insert section headers using ## before a label. "
                 "KM uploads populate hazard ratios and preserve log-rank / proportionality p-values as metadata."
             )
-            editable_cols = required_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]
+            editable_cols = required_cols + optional_cols + ["Effect Type", "TriNetX Table Type", "Log-Rank p", "PH Assumption p", "Source File"]
             edited_df = st.data_editor(
                 combined_df[editable_cols],
                 num_rows="dynamic",
@@ -452,6 +727,7 @@ if input_mode == "📤 Upload file(s)":
                         disabled=True,
                         help="Auto-calculated as ln(RR/OR/HR) × sqrt(3)/π",
                     ),
+                    "p": st.column_config.NumberColumn("p", format="%.4g"),
                     "Effect Type": st.column_config.TextColumn(disabled=True),
                     "TriNetX Table Type": st.column_config.TextColumn(disabled=True),
                     "Log-Rank p": st.column_config.NumberColumn(disabled=True, format="%.4g"),
@@ -487,9 +763,10 @@ else:
         "Risk, Odds, or Hazard Ratio": [None, 1.5, 1.2, None, 0.85, 1.2],
         "Lower CI": [None, 1.2, 1.0, None, 0.7, 1.0],
         "Upper CI": [None, 1.8, 1.5, None, 1.0, 1.4],
+        "p": [None, 0.002, 0.049, None, 0.073, 0.041],
     })
     default_data["Effect Size (Cohen's d, approx.)"] = default_data["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
-    default_data = default_data[required_cols]
+    default_data = default_data[required_cols + optional_cols]
 
     if "manual_table" not in st.session_state:
         st.session_state.manual_table = default_data.copy()
@@ -497,11 +774,13 @@ else:
     _, col2 = st.columns([2, 1])
     with col2:
         if st.button("🧹 Clear Table"):
-            st.session_state.manual_table = pd.DataFrame({col: [None] * 6 for col in required_cols})
+            st.session_state.manual_table = pd.DataFrame({col: [None] * 6 for col in required_cols + optional_cols})
 
     manual_df = st.session_state.manual_table.copy()
     manual_df["Effect Size (Cohen's d, approx.)"] = manual_df["Risk, Odds, or Hazard Ratio"].apply(compute_cohens_d)
-    manual_df = manual_df[required_cols]
+    if "p" not in manual_df.columns:
+        manual_df["p"] = np.nan
+    manual_df = manual_df[required_cols + optional_cols]
     st.session_state.manual_table = st.data_editor(
         manual_df,
         num_rows="dynamic",
@@ -512,7 +791,8 @@ else:
                 "Effect Size (Cohen's d, approx.)",
                 disabled=True,
                 help="Auto-calculated as ln(RR/OR/HR) × sqrt(3)/π",
-            )
+            ),
+            "p": st.column_config.NumberColumn("p", format="%.4g")
         },
     )
     df = st.session_state.manual_table
@@ -543,12 +823,15 @@ if df is not None:
 
     plot_title = st.sidebar.text_input("Plot Title", value="Forest Plot")
     show_grid = st.sidebar.checkbox("Show Grid", value=True)
-    show_values = st.sidebar.checkbox("Show Numerical Annotations", value=False)
+    show_values = False  # Right-side numerical annotations are always shown in hybrid layout
     use_groups = st.sidebar.checkbox("Treat rows starting with '##' as section headers", value=True)
 
     with st.sidebar.expander("🎨 Advanced Visual Controls", expanded=False):
         color_scheme = st.selectbox("Color Scheme", ["Color", "Black & White"])
-        point_size = st.slider("Marker Size", 6, 20, 10)
+        table_header_color = st.color_picker("Section Header Color", "#203F99") if color_scheme == "Color" else "#111111"
+        significant_color = st.color_picker("Significant Marker Color", "#1F3D99") if color_scheme == "Color" else "#111111"
+        nonsignificant_color = st.color_picker("Non-significant Marker Color", "#666666")
+        point_size = st.slider("Marker Size", 6, 20, 9)
         line_width = st.slider("CI Line Width", 1, 4, 2)
         font_size = st.slider("Font Size", 10, 20, 12)
         label_offset = st.slider("Label Horizontal Offset", 0.01, 0.3, 0.05)
@@ -615,103 +898,57 @@ if df is not None:
         manual_x_max = None
 
     if st.button("📊 Generate Forest Plot"):
-        rows = []
-        y_labels = []
-        text_styles = []
-        indent = "\u00A0" * 4
-        group_mode = False
-
-        for _, row in df.iterrows():
-            if use_groups and isinstance(row["Outcome"], str) and row["Outcome"].startswith("##"):
-                header = row["Outcome"][3:].strip()
-                y_labels.append(header)
-                text_styles.append("bold")
-                rows.append(None)
-                group_mode = True
-            else:
-                display_name = f"{indent}{row['Outcome']}" if group_mode else row["Outcome"]
-                y_labels.append(display_name)
-                text_styles.append("normal")
-                rows.append(row)
-
         if ci_vals.empty:
             st.error("No plottable effect estimates were found.")
         else:
-            fig, ax = plt.subplots(figsize=(10, max(2.5, len(y_labels) * 0.7)))
-
             if manual_x_axis:
                 if manual_x_min >= manual_x_max:
                     st.error("The X-axis minimum must be smaller than the X-axis maximum.")
                     st.stop()
-                ax.set_xlim(manual_x_min, manual_x_max)
+                plot_x_min, plot_x_max = manual_x_min, manual_x_max
             else:
                 if x_measure == "Risk, Odds, or Hazard Ratio":
-                    auto_plot_x_min, auto_plot_x_max = compute_ratio_axis_limits(ci_vals, axis_padding, use_log=use_log)
-                    ax.set_xlim(auto_plot_x_min, auto_plot_x_max)
+                    plot_x_min, plot_x_max = compute_ratio_axis_limits(ci_vals, axis_padding, use_log=use_log)
                 else:
                     x_min, x_max = ci_vals.min(), ci_vals.max()
                     x_pad = (x_max - x_min) * (axis_padding / 100) if x_max != x_min else 0.1
-                    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+                    plot_x_min, plot_x_max = x_min - x_pad, x_max + x_pad
 
-            for i, row in enumerate(rows):
-                if row is None:
-                    continue
+            try:
+                fig = create_forest_table_hybrid(
+                    df=df,
+                    plot_column=plot_column,
+                    x_measure=x_measure,
+                    x_axis_label=x_axis_label,
+                    ref_line=ref_line,
+                    x_min=plot_x_min,
+                    x_max=plot_x_max,
+                    use_groups=use_groups,
+                    use_log=use_log,
+                    show_grid=show_grid,
+                    plot_title=plot_title,
+                    font_size=font_size,
+                    point_size=point_size,
+                    line_width=line_width,
+                    cap_height=cap_height,
+                    header_color=table_header_color,
+                    significant_color=significant_color,
+                    nonsignificant_color=nonsignificant_color,
+                )
+            except ValueError as e:
+                st.error(str(e))
+                st.stop()
 
-                if x_measure == "Effect Size (Cohen's d, approx.)":
-                    effect = row.get("Effect Size (Cohen's d, approx.)", np.nan)
-                    lci = compute_cohens_d(row.get("Lower CI", np.nan))
-                    uci = compute_cohens_d(row.get("Upper CI", np.nan))
-                else:
-                    effect = pd.to_numeric(pd.Series([row.get("Risk, Odds, or Hazard Ratio", np.nan)]), errors="coerce").iloc[0]
-                    lci = pd.to_numeric(pd.Series([row.get("Lower CI", np.nan)]), errors="coerce").iloc[0]
-                    uci = pd.to_numeric(pd.Series([row.get("Upper CI", np.nan)]), errors="coerce").iloc[0]
-
-                if pd.notnull(lci) and pd.notnull(uci):
-                    ax.hlines(i, xmin=lci, xmax=uci, color=ci_color, linewidth=line_width, capstyle="round")
-                    ax.vlines(
-                        [lci, uci],
-                        [i - cap_height, i - cap_height],
-                        [i + cap_height, i + cap_height],
-                        color=ci_color,
-                        linewidth=line_width,
-                    )
-
-                if pd.notnull(effect):
-                    ax.plot(effect, i, "o", color=marker_color, markersize=point_size, zorder=3)
-                    if show_values and pd.notnull(lci) and pd.notnull(uci):
-                        label = f"{effect:.2f} [{lci:.2f}, {uci:.2f}]"
-                        ax.text(uci + label_offset, i, label, va="center", fontsize=font_size - 2)
-
-            ax.axvline(x=ref_line, color="gray", linestyle="--", linewidth=1)
-            ax.set_yticks(range(len(y_labels)))
-            for tick_label, style in zip(ax.set_yticklabels(y_labels), text_styles):
-                if style == "bold":
-                    tick_label.set_fontweight("bold")
-                tick_label.set_fontsize(font_size)
-
-            if use_log:
-                try:
-                    ax.set_xscale("log")
-                except Exception:
-                    st.warning("Log scale is only valid for positive numbers.")
-            if show_grid:
-                ax.grid(True, axis="x", linestyle=":", linewidth=0.6)
-            else:
-                ax.grid(False)
-
-            ax.set_ylim(len(y_labels) - 1 + y_axis_padding, -1 - y_axis_padding)
-            ax.set_xlabel(x_axis_label, fontsize=font_size)
-            ax.set_title(plot_title, fontsize=font_size + 2, weight="bold")
-            fig.tight_layout()
-            st.pyplot(fig)
+            st.pyplot(fig, use_container_width=True)
 
             buf = io.BytesIO()
             fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
             st.download_button(
                 "📥 Download Plot as PNG",
                 data=buf.getvalue(),
-                file_name="forest_plot.png",
+                file_name="forest_plot_table_hybrid.png",
                 mime="image/png",
             )
+
 else:
     st.info("Please upload file(s) or enter data manually to generate a plot.")
